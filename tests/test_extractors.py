@@ -10,7 +10,6 @@ from invoice_pipeline.workflow import extractors
 from invoice_pipeline.workflow.extractors import (
     FrontierExtractor,
     SpecialistExtractor,
-    _parse_wire_invoice,
 )
 from invoice_pipeline.schema import Invoice, LineItem, WireInvoice
 
@@ -149,18 +148,65 @@ async def test_specialist_sends_wire_schema_via_response_format():
 
 
 @pytest.mark.anyio
-async def test_specialist_parses_locale_formatted_wire_amounts():
+async def test_specialist_keeps_three_decimal_amounts_exact():
+    # the wire grammar only admits dot-decimal, so a 3-digit fraction is a
+    # fraction — not a thousands separator (regression: 0.064 used to become 64)
     raw = """{
-        "document_type": "invoice", "currency": "USD",
-        "grand_total": "20.000,00", "subtotal": "20.000,00",
-        "line_items": []
+        "document_type": "receipt", "currency": "KWD",
+        "grand_total": "12.500", "subtotal": "12.500",
+        "line_items": [
+            {"description": "Bananas", "unit_price": "1.879",
+             "quantity": "0.064", "line_total": "0.120"},
+            {"description": "Fuel", "unit_price": "33.415",
+             "quantity": "3.000", "line_total": "100.245"}
+        ]
     }"""
     extractor = _specialist(_fake_specialist_client(raw))
 
     result = await extractor.extract_invoice("fake.png")
 
     assert result.parse_error is None
-    assert result.invoice.grand_total == Decimal("20000.00")
+    assert result.invoice.grand_total == Decimal("12.500")
+    assert result.invoice.subtotal == Decimal("12.500")
+    first, second = result.invoice.line_items
+    assert first.quantity == Decimal("0.064")
+    assert first.unit_price == Decimal("1.879")
+    assert first.line_total == Decimal("0.120")
+    assert second.unit_price == Decimal("33.415")
+    assert second.quantity == Decimal("3.000")
+    assert second.line_total == Decimal("100.245")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("amount", ["20.000,00", "1,234.56", "1 234.56", "$12.00"])
+async def test_specialist_rejects_non_canonical_wire_amounts(amount):
+    # if the grammar constraint is ever silently dropped, locale-formatted
+    # output must fail loudly (-> frontier fallback), never be guessed at
+    raw = f"""{{
+        "document_type": "invoice", "currency": "USD",
+        "grand_total": "{amount}", "line_items": []
+    }}"""
+    extractor = _specialist(_fake_specialist_client(raw))
+
+    result = await extractor.extract_invoice("fake.png")
+
+    assert result.invoice is None
+    assert result.parse_error.startswith("invalid_output")
+
+
+@pytest.mark.anyio
+async def test_specialist_rejects_non_canonical_optional_amount():
+    # previously an unparseable optional amount was silently nulled
+    raw = """{
+        "document_type": "invoice", "currency": "USD",
+        "grand_total": "100.00", "tax": "19,00", "line_items": []
+    }"""
+    extractor = _specialist(_fake_specialist_client(raw))
+
+    result = await extractor.extract_invoice("fake.png")
+
+    assert result.invoice is None
+    assert result.parse_error.startswith("invalid_output")
 
 
 @pytest.mark.anyio
@@ -191,58 +237,40 @@ async def test_specialist_strips_sign_from_wire_discount():
     assert result.invoice.discount == Decimal("25.00")
 
 
-def test_parse_wire_invoice_converts_top_level_money_fields():
-    data = {
-        "grand_total": "1.500,50",
-        "subtotal": "1.000,00",
-        "tax": "500,50",
-        "service_charge": None,
-        "discount": None,
-        "line_items": [],
-    }
+@pytest.mark.anyio
+async def test_specialist_strips_sign_from_discount_only():
+    raw = """{
+        "document_type": "invoice", "currency": "USD",
+        "grand_total": "-100.00", "discount": "-10.00",
+        "line_items": [{"line_total": "-5.00"}]
+    }"""
+    extractor = _specialist(_fake_specialist_client(raw))
 
-    result = _parse_wire_invoice(data)
+    result = await extractor.extract_invoice("fake.png")
 
-    assert result["grand_total"] == Decimal("1500.50")
-    assert result["subtotal"] == Decimal("1000.00")
-    assert result["tax"] == Decimal("500.50")
-    assert result["service_charge"] is None
-    assert result["discount"] is None
+    assert result.parse_error is None
+    assert result.invoice.grand_total == Decimal("-100.00")
+    assert result.invoice.discount == Decimal("10.00")
+    assert result.invoice.line_items[0].line_total == Decimal("-5.00")
 
 
-def test_parse_wire_invoice_strips_sign_from_discount_only():
-    data = {
-        "grand_total": "-100.00",
-        "discount": "-10.00",
-        "line_items": [],
-    }
+@pytest.mark.anyio
+async def test_specialist_keeps_null_amounts_null():
+    raw = """{
+        "document_type": "receipt", "currency": "USD",
+        "grand_total": "9.99", "subtotal": null, "discount": null,
+        "line_items": [{"description": "Tea", "unit_price": null,
+                        "quantity": null, "line_total": "9.99"}]
+    }"""
+    extractor = _specialist(_fake_specialist_client(raw))
 
-    result = _parse_wire_invoice(data)
+    result = await extractor.extract_invoice("fake.png")
 
-    assert result["grand_total"] == Decimal("-100.00")
-    assert result["discount"] == Decimal("10.00")
-
-
-def test_parse_wire_invoice_converts_line_item_money_fields():
-    data = {
-        "grand_total": "100.00",
-        "discount": None,
-        "line_items": [
-            {
-                "description": "Widget",
-                "unit_price": "20,00",
-                "quantity": "2",
-                "line_total": "40,00",
-            }
-        ],
-    }
-
-    result = _parse_wire_invoice(data)
-
-    item = result["line_items"][0]
-    assert item["unit_price"] == Decimal("20.00")
-    assert item["quantity"] == Decimal("2")
-    assert item["line_total"] == Decimal("40.00")
+    assert result.parse_error is None
+    assert result.invoice.subtotal is None
+    assert result.invoice.discount is None
+    assert result.invoice.line_items[0].unit_price is None
+    assert result.invoice.line_items[0].quantity is None
 
 
 @pytest.mark.anyio

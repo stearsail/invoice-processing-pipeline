@@ -2,7 +2,6 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
-from invoice_pipeline.util.pricing import parse_price
 from invoice_pipeline.workflow.error_categories import categorize_error
 from invoice_pipeline.workflow.images import load_image_b64
 from invoice_pipeline.schema import Invoice, WireInvoice
@@ -11,22 +10,16 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-_MONEY_FIELDS = ("grand_total", "subtotal", "tax", "service_charge")
-_LINE_ITEM_MONEY_FIELDS = ("unit_price", "quantity", "line_total")
 
-
-def _parse_wire_invoice(data: dict) -> dict:
-    for field in _MONEY_FIELDS:
-        data[field] = parse_price(data.get(field))
-
-    raw_discount = data.get("discount")
-    if isinstance(raw_discount, str):
-        raw_discount = raw_discount.removeprefix("-")
-    data["discount"] = parse_price(raw_discount)
-
-    for item in data.get("line_items", []):
-        for field in _LINE_ITEM_MONEY_FIELDS:
-            item[field] = parse_price(item.get(field))
+# Amounts need no parsing here: the WireDecimal grammar pattern guarantees
+# canonical dot-decimal strings, which Invoice.model_validate converts to
+# Decimal exactly — and rejects (-> invalid_output) if the constraint was dropped.
+# The discount sign is a schema convention (reconciliation subtracts it) and
+# should move onto Invoice so the frontier path gets it too.
+def _strip_discount_sign(data: dict) -> dict:
+    discount = data.get("discount")
+    if isinstance(discount, str):
+        data["discount"] = discount.removeprefix("-")
     return data
 
 
@@ -82,7 +75,7 @@ class SpecialistExtractor:
                 },
                 seed=self._seed,
             )
-            data = _parse_wire_invoice(json.loads(response.choices[0].message.content))
+            data = _strip_discount_sign(json.loads(response.choices[0].message.content))
             return ExtractionResult(
                 invoice=Invoice.model_validate(data),
                 parse_error=None,
