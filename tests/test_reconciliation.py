@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from invoice_pipeline.util.reconciliation import reconcile
 from invoice_pipeline.schema import Invoice, LineItem
 
@@ -212,3 +214,54 @@ def test_both_checks_can_fail_independently():
         grand_total=Decimal("500"),
     )
     assert len(reconcile(invoice)) == 2
+
+
+@pytest.mark.parametrize(
+    "discount",
+    [
+        pytest.param(Decimal("5"), id="positive-decimal"),
+        pytest.param(Decimal("-5"), id="negative-decimal"),
+        pytest.param("-5.00", id="negative-wire-string"),
+        pytest.param(-5.0, id="negative-tool-call-float"),
+    ],
+)
+def test_discount_is_subtracted_whatever_sign_it_was_given_with(discount):
+    # 100 + 10 tax - 5 discount = 105. Before the schema rule, a negative
+    # discount was *added* (100 + 10 - (-5) = 115) and falsely flagged.
+    invoice = Invoice.model_validate(
+        {
+            "document_type": "receipt",
+            "currency": "USD",
+            "grand_total": "105",
+            "subtotal": "100",
+            "tax": "10",
+            "discount": discount,
+            "line_items": [{"line_total": "100"}],
+        }
+    )
+
+    assert reconcile(invoice) == []
+
+
+def test_correct_discounted_receipt_is_not_flagged():
+    # regression: an after-validator that fell through on positive values
+    # returned None, deleting the discount and flagging this as a 5.00 mismatch
+    invoice = _invoice(
+        grand_total=Decimal("105"), tax=Decimal("10"), discount=Decimal("5")
+    )
+
+    assert invoice.discount == Decimal("5")
+    assert reconcile(invoice) == []
+
+
+def test_wrong_grand_total_is_still_flagged_with_a_discount():
+    # normalizing the sign must not make the check permissive
+    invoice = _invoice(
+        grand_total=Decimal("115"), tax=Decimal("10"), discount=Decimal("-5")
+    )
+
+    issues = reconcile(invoice)
+
+    assert len(issues) == 1
+    assert issues[0].category == "mismatch"
+    assert "Grand total computation: 105" in issues[0].message

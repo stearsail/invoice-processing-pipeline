@@ -1,7 +1,7 @@
 from typing import Annotated, Literal
 from datetime import date
 from decimal import Decimal
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator
 
 
 class Party(BaseModel):
@@ -36,6 +36,13 @@ class Invoice(BaseModel):
     service_charge: Decimal | None = None
     discount: Decimal | None = None
     confidence_notes: list[str] = Field(default_factory=list)
+
+    @field_validator("discount", mode="after")
+    @classmethod
+    def normalize_discount(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        return value.copy_abs()
 
 
 # Wire schemas are needed for vLLM's guided decoding which use grammar-constrained decoding backend

@@ -224,33 +224,23 @@ async def test_specialist_parses_negative_grand_total_from_wire_response():
 
 
 @pytest.mark.anyio
-async def test_specialist_strips_sign_from_wire_discount():
-    raw = """{
+@pytest.mark.parametrize("wire_discount", ['"25.00"', '"-25.00"'])
+async def test_specialist_applies_schema_discount_rule(wire_discount):
+    # the sign rule lives on Invoice, not in the extractor — this pins that the
+    # specialist path still goes through it (and that only discount is affected)
+    raw = f"""{{
         "document_type": "invoice", "currency": "USD",
-        "grand_total": "100.00", "discount": "-25.00", "line_items": []
-    }"""
+        "grand_total": "-100.00", "discount": {wire_discount},
+        "line_items": [{{"line_total": "-5.00"}}]
+    }}"""
     extractor = _specialist(_fake_specialist_client(raw))
 
     result = await extractor.extract_invoice("fake.png")
 
     assert result.parse_error is None
+    assert isinstance(result.invoice.discount, Decimal)
     assert result.invoice.discount == Decimal("25.00")
-
-
-@pytest.mark.anyio
-async def test_specialist_strips_sign_from_discount_only():
-    raw = """{
-        "document_type": "invoice", "currency": "USD",
-        "grand_total": "-100.00", "discount": "-10.00",
-        "line_items": [{"line_total": "-5.00"}]
-    }"""
-    extractor = _specialist(_fake_specialist_client(raw))
-
-    result = await extractor.extract_invoice("fake.png")
-
-    assert result.parse_error is None
     assert result.invoice.grand_total == Decimal("-100.00")
-    assert result.invoice.discount == Decimal("10.00")
     assert result.invoice.line_items[0].line_total == Decimal("-5.00")
 
 

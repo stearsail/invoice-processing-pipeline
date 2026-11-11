@@ -11,18 +11,6 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 
-# Amounts need no parsing here: the WireDecimal grammar pattern guarantees
-# canonical dot-decimal strings, which Invoice.model_validate converts to
-# Decimal exactly — and rejects (-> invalid_output) if the constraint was dropped.
-# The discount sign is a schema convention (reconciliation subtracts it) and
-# should move onto Invoice so the frontier path gets it too.
-def _strip_discount_sign(data: dict) -> dict:
-    discount = data.get("discount")
-    if isinstance(discount, str):
-        data["discount"] = discount.removeprefix("-")
-    return data
-
-
 @dataclass
 class ExtractionResult:
     invoice: Invoice | None
@@ -75,9 +63,10 @@ class SpecialistExtractor:
                 },
                 seed=self._seed,
             )
-            data = _strip_discount_sign(json.loads(response.choices[0].message.content))
             return ExtractionResult(
-                invoice=Invoice.model_validate(data),
+                invoice=Invoice.model_validate(
+                    json.loads(response.choices[0].message.content)
+                ),
                 parse_error=None,
             )
         except Exception as e:

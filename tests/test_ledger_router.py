@@ -217,6 +217,55 @@ async def test_edit_job_on_flagged_entry_with_no_changes_marks_reviewed_without_
 
 
 @pytest.mark.anyio
+async def test_edit_job_stores_a_reviewer_entered_negative_discount_as_positive(
+    session,
+):
+    # FastAPI builds the request body with Invoice.model_validate, so a
+    # reviewer typing "-5.00" goes through the same schema rule as the models
+    job = await _failed_job(session)
+    submitted = Invoice.model_validate(
+        {
+            "document_type": "receipt",
+            "currency": "USD",
+            "grand_total": "95.00",
+            "discount": "-5.00",
+        }
+    )
+
+    response = await edit_job(job_id=job.id, invoice=submitted, session=session)
+
+    assert response.ledger_entry.invoice_data.discount == Decimal("5.00")
+
+
+@pytest.mark.anyio
+async def test_edit_job_does_not_count_a_discount_sign_flip_as_a_change(session):
+    # "-5.00" and "5.00" are the same discount; confirming an entry while
+    # typing the sign differently is a confirmation, not a correction
+    job = await create_job(session, file_key="d4e5f6a7.png")
+    await update_job(
+        session, job_id=job.id, status_update="complete", attempts_update=1
+    )
+    await write_entry(
+        session,
+        job.id,
+        _invoice(grand_total=Decimal("95.00"), discount=Decimal("5.00")),
+        needs_review=True,
+    )
+    resubmitted = Invoice.model_validate(
+        {
+            "document_type": "receipt",
+            "currency": "USD",
+            "grand_total": "95.00",
+            "discount": "-5.00",
+        }
+    )
+
+    response = await edit_job(job_id=job.id, invoice=resubmitted, session=session)
+
+    assert response.ledger_entry.reviewed_with_changes is False
+
+
+@pytest.mark.anyio
 async def test_edit_job_raises_404_for_unknown_job(session):
     with pytest.raises(HTTPException) as exc_info:
         await edit_job(job_id=999, invoice=_invoice(), session=session)
