@@ -16,6 +16,8 @@ async def run_extraction(job_id: int, img_path: str) -> ExtractionResult:
             "job_id": job_id,
             "image": img_path,
             "invoice": None,
+            "extracted_by": None,
+            "frontier_attempted": False,
         }
     )
     if final_state["invoice"] is None:

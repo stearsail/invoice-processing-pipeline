@@ -9,7 +9,8 @@ class State(TypedDict):
     invoice: Invoice | None
     parse_error: str | None
     reconciliation_issues: list[ReconciliationIssue]
-    attempt: Literal["specialist", "frontier"]
+    extracted_by: Literal["specialist", "frontier"] | None
+    frontier_attempted: bool
     ledger_entry_id: int
 
 

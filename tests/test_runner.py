@@ -43,6 +43,21 @@ async def test_run_extraction_seeds_state_from_job_and_path(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_run_extraction_seeds_provenance_and_retry_budget(monkeypatch):
+    # route_after_reconcile reads frontier_attempted on any draft with issues,
+    # and LangGraph state only holds keys someone wrote — an unseeded key is a
+    # KeyError mid-graph, not a default
+    graph = _fake_graph({"invoice": MagicMock(), "ledger_entry_id": 1})
+    monkeypatch.setattr(runner, "graph", graph)
+
+    await runner.run_extraction(job_id=1, img_path="fake.png")
+
+    seeded = graph.ainvoke.await_args.kwargs["input"]
+    assert seeded["extracted_by"] is None
+    assert seeded["frontier_attempted"] is False
+
+
+@pytest.mark.anyio
 async def test_run_extraction_reports_failure_with_joined_issue_messages(monkeypatch):
     graph = _fake_graph(
         {

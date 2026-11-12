@@ -7,10 +7,14 @@ from invoice_pipeline.db.engine import session_factory
 
 async def specialist_extract(specialist: SpecialistExtractor, state: State) -> dict:
     result = await specialist.extract_invoice(state["image"])
+    if result.invoice is None:
+        extracted_by = None
+    else:
+        extracted_by = "specialist"
     return {
         "invoice": result.invoice,
         "parse_error": result.parse_error,
-        "attempt": "specialist",
+        "extracted_by": extracted_by,
     }
 
 
@@ -18,10 +22,15 @@ async def frontier_extract(
     frontier: FrontierExtractor, state: State, extra_context: str = ""
 ) -> dict:
     result = await frontier.extract_invoice(state["image"], extra_context)
+    if result.invoice is None:
+        extracted_by = None
+    else:
+        extracted_by = "frontier"
     return {
         "invoice": result.invoice,
         "parse_error": result.parse_error,
-        "attempt": "frontier",
+        "extracted_by": extracted_by,
+        "frontier_attempted": True,
     }
 
 
@@ -57,9 +66,10 @@ async def frontier_review_fallback(frontier: FrontierExtractor, state: State) ->
         f"— take these into consideration: {state['reconciliation_issues']}"
     )
     result = await frontier.extract_invoice(state["image"], context)
-    update = {"parse_error": result.parse_error, "attempt": "frontier"}
+    update = {"parse_error": result.parse_error, "frontier_attempted": True}
     if result.invoice is not None:
         update["invoice"] = result.invoice
+        update["extracted_by"] = "frontier"
     return update
 
 
@@ -72,7 +82,7 @@ def route_after_parsing(state: State) -> str:
 def route_after_reconcile(state: State) -> str:
     if state["invoice"] is None:
         return "total_failure"
-    if state["reconciliation_issues"] and state["attempt"] == "specialist":
+    if state["reconciliation_issues"] and not state["frontier_attempted"]:
         return "retry_via_frontier"
     return "reconciled"
 
@@ -88,6 +98,6 @@ async def ledger_write(state: State) -> dict:
             state["invoice"],
             needs_review=True,
             review_reason=review_reason,
-            extracted_by=state["attempt"],
+            extracted_by=state["extracted_by"],
         )
     return {"ledger_entry_id": entry.id}
