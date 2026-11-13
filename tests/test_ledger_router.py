@@ -1,5 +1,7 @@
+import logging
 from datetime import datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -7,9 +9,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from invoice_pipeline.api.routers.ledger import _to_response, edit_job
+from invoice_pipeline.api.routers.ledger import _to_response, edit_job, retry_job
 from invoice_pipeline.db.models import Job, LedgerEntry
 from invoice_pipeline.db.operations import create_job, update_job, write_entry
+from invoice_pipeline.queue.jobs import arq_job_id
 from invoice_pipeline.schema import Invoice
 
 
@@ -272,3 +275,43 @@ async def test_edit_job_raises_404_for_unknown_job(session):
 
     assert exc_info.value.status_code == 404
     assert "999" in exc_info.value.detail
+
+
+async def _errored_job(session) -> Job:
+    job = await create_job(session, file_key="e5f6a7b8.png")
+    return await update_job(
+        session,
+        job_id=job.id,
+        status_update="error",
+        attempts_update=3,
+        error_update="TimeoutError",
+    )
+
+
+@pytest.mark.anyio
+async def test_retry_job_enqueues_with_the_derived_arq_id(session):
+    job = await _errored_job(session)
+    pool = AsyncMock()
+
+    response = await retry_job(job_id=job.id, session=session, pool=pool)
+
+    assert response.status == "pending"
+    assert response.error is None
+    pool.enqueue_job.assert_awaited_once_with(
+        "process_job", job.id, job.file_key, _job_id=arq_job_id(job.id)
+    )
+
+
+@pytest.mark.anyio
+async def test_retry_job_of_a_job_arq_still_has_logs_and_returns_pending(
+    session, caplog
+):
+    job = await _errored_job(session)
+    pool = AsyncMock()
+    pool.enqueue_job.return_value = None
+
+    with caplog.at_level(logging.WARNING, logger="invoice_pipeline.api.routers.ledger"):
+        response = await retry_job(job_id=job.id, session=session, pool=pool)
+
+    assert response.status == "pending"
+    assert arq_job_id(job.id) in caplog.text

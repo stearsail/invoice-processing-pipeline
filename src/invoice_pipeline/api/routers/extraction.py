@@ -1,4 +1,6 @@
+import logging
 from arq import ArqRedis
+from invoice_pipeline.queue.jobs import arq_job_id
 from invoice_pipeline.queue.pool import get_redis_pool
 import uuid
 import aiofiles
@@ -11,7 +13,7 @@ from invoice_pipeline.db.engine import get_async_session
 from invoice_pipeline.db.operations import create_job, query_job
 from invoice_pipeline.config import UPLOADS_DIR
 
-
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/extraction", tags=["extraction"])
 
 _ALLOWED_TYPES = {"image/jpeg": "jpeg", "image/png": "png"}
@@ -51,7 +53,18 @@ async def upload(
         job = await create_job(session, key)
         created_jobs.append(job)
     for job in created_jobs:
-        await pool.enqueue_job("process_job", job.id, job.file_key)
+        arq_job = await pool.enqueue_job(
+            "process_job", job.id, job.file_key, _job_id=arq_job_id(job.id)
+        )
+        if arq_job is None:
+            # a brand-new row should never collide; if it does, Redis still
+            # holds a job from before the DB was reset (ids restarted)
+            logger.warning(
+                "Job %s (%s) already exists in arq on upload; not enqueued. "
+                "Redis likely holds a stale job from before a DB reset",
+                job.id,
+                arq_job_id(job.id),
+            )
     return [
         JobCreationResponse(job_id=job.id, status=job.status) for job in created_jobs
     ]

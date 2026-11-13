@@ -1,4 +1,5 @@
 from datetime import date
+from typing import get_args
 from decimal import Decimal
 
 import pytest
@@ -6,10 +7,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from invoice_pipeline.db.models import Job
 from invoice_pipeline.db.operations import (
+    PENDING_STATUSES,
     create_job,
     find_duplicate,
+    mark_job_orphaned,
     query_errored_jobs,
+    query_pending_jobs,
     query_resolved_ledger,
     query_job,
     query_reviewables,
@@ -370,3 +375,66 @@ async def test_query_resolved_ledger_excludes_pending_and_errored_jobs(session):
     returned_job, returned_entry = resolved[0]
     assert returned_job.id == clean_job.id
     assert returned_entry.needs_review is False
+
+
+_ALL_JOB_STATUSES = get_args(Job.model_fields["status"].annotation)
+_TERMINAL_STATUSES = [s for s in _ALL_JOB_STATUSES if s not in PENDING_STATUSES]
+
+
+async def _job_with_status(session, status: str, attempts: int = 1) -> Job:
+    job = await create_job(session, file_key=f"{status}.png")
+    return await update_job(
+        session,
+        job_id=job.id,
+        status_update=status,
+        attempts_update=attempts,
+        error_update="previous error",
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", PENDING_STATUSES)
+async def test_mark_job_orphaned_moves_pending_rows_to_error(session, status):
+    job = await _job_with_status(session, status, attempts=2)
+
+    reaped = await mark_job_orphaned(session, job.id, "orphaned: test")
+
+    updated = await query_job(session, job.id)
+    assert reaped is True
+    assert updated.status == "error"
+    assert updated.error == "orphaned: test"
+    # the reaper didn't run an attempt
+    assert updated.attempts == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", _TERMINAL_STATUSES)
+async def test_mark_job_orphaned_never_overwrites_a_final_status(session, status):
+    # race A: the worker wrote its final status before the reaper's UPDATE
+    job = await _job_with_status(session, status)
+
+    reaped = await mark_job_orphaned(session, job.id, "orphaned: test")
+
+    updated = await query_job(session, job.id)
+    assert reaped is False
+    assert updated.status == status
+    assert updated.error == "previous error"
+
+
+@pytest.mark.anyio
+async def test_mark_job_orphaned_returns_false_for_unknown_job(session):
+    assert await mark_job_orphaned(session, 999, "orphaned: test") is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", _ALL_JOB_STATUSES)
+async def test_reaper_select_and_update_agree_on_which_statuses_are_pending(
+    session, status
+):
+    # a row the reaper selects must be one it can update, and vice versa
+    job = await _job_with_status(session, status)
+
+    selected = job.id in {j.id for j in await query_pending_jobs(session)}
+    updatable = await mark_job_orphaned(session, job.id, "orphaned: test")
+
+    assert selected == updatable

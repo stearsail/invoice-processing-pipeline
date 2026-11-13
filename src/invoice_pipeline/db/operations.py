@@ -1,9 +1,11 @@
 from typing import Literal
 
 from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlmodel import or_, select
+from sqlmodel import or_, select, update
 from invoice_pipeline.db.models import Job, LedgerEntry
 from invoice_pipeline.schema import Invoice
+
+PENDING_STATUSES = ("pending", "retrying")
 
 
 async def create_job(session: AsyncSession, file_key: str) -> Job:
@@ -150,9 +152,21 @@ async def query_resolved_ledger(
 
 
 async def query_pending_jobs(session: AsyncSession) -> list[Job]:
-    statement = select(Job).where(Job.status.in_(["pending", "retrying"]))
+    statement = select(Job).where(Job.status.in_(PENDING_STATUSES))
     results = await session.exec(statement)
     return results.all()
+
+
+async def mark_job_orphaned(session: AsyncSession, job_id: int, error: str) -> bool:
+    # status check inside the UPDATE, so a worker finishing first can't be overwritten
+    statement = (
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(PENDING_STATUSES))
+        .values(status="error", error=error)
+    )
+    result = await session.exec(statement)
+    await session.commit()
+    return result.rowcount == 1
 
 
 async def query_errored_jobs(session: AsyncSession) -> list[Job]:

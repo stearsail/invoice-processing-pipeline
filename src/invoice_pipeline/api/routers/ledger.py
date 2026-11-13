@@ -23,6 +23,7 @@ from invoice_pipeline.db.operations import (
     update_job,
     write_entry,
 )
+from invoice_pipeline.queue.jobs import arq_job_id
 from invoice_pipeline.queue.pool import get_redis_pool
 from invoice_pipeline.schema import Invoice
 
@@ -193,5 +194,15 @@ async def retry_job(
         attempts_update=job.attempts,
         error_update=None,
     )
-    await pool.enqueue_job("process_job", job.id, job.file_key)
+    arq_job = await pool.enqueue_job(
+        "process_job", job.id, job.file_key, _job_id=arq_job_id(job.id)
+    )
+    if arq_job is None:
+        # arq already has a live job for this row (e.g. the reaper marked it
+        # error between commit and enqueue) — it will write the final status
+        logger.warning(
+            "Job %s (%s) is already queued or running in arq; retry not re-enqueued",
+            job.id,
+            arq_job_id(job.id),
+        )
     return _to_errored_response(job)

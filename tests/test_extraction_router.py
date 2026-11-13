@@ -1,4 +1,5 @@
 import io
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -9,6 +10,7 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from invoice_pipeline.api.routers import extraction
+from invoice_pipeline.queue.jobs import arq_job_id
 
 
 @pytest.fixture
@@ -71,3 +73,37 @@ async def test_upload_rejects_invalid_file_type(in_memory_session_factory):
     with pytest.raises(HTTPException):
         async with in_memory_session_factory() as session:
             await extraction.upload(files=files, session=session, pool=AsyncMock())
+
+
+@pytest.mark.anyio
+async def test_upload_passes_the_derived_arq_id_as_arqs_job_id(
+    in_memory_session_factory,
+):
+    pool = AsyncMock()
+
+    async with in_memory_session_factory() as session:
+        [response] = await extraction.upload(
+            files=[_upload_file("a.png")], session=session, pool=pool
+        )
+
+    call = pool.enqueue_job.await_args
+    # positional args go to process_job: the DB id must stay an int
+    assert call.args[1] == response.job_id
+    assert call.kwargs["_job_id"] == arq_job_id(response.job_id)
+
+
+@pytest.mark.anyio
+async def test_upload_logs_and_still_responds_when_arq_already_has_the_job(
+    in_memory_session_factory, caplog
+):
+    pool = AsyncMock()
+    pool.enqueue_job.return_value = None
+
+    with caplog.at_level(logging.WARNING, logger=extraction.__name__):
+        async with in_memory_session_factory() as session:
+            [response] = await extraction.upload(
+                files=[_upload_file("a.png")], session=session, pool=pool
+            )
+
+    assert response.status == "pending"
+    assert arq_job_id(response.job_id) in caplog.text
