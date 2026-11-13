@@ -25,6 +25,12 @@ from invoice_pipeline.workflow.extractors import (
 GOLDEN_SET_PATH = config.PROJECT_ROOT / "data" / "golden" / "test.jsonl"
 IMAGE_ROOT = config.PROJECT_ROOT / "data" / "processed"
 
+# The benchmark has no job deadline and no arq around it to retry, so it keeps
+# the SDKs' own defaults (600s, and 2 retries for the specialist) rather than
+# the production budget in config — published numbers were produced this way.
+_EVAL_TIMEOUT_S = 600.0
+_EVAL_SPECIALIST_MAX_RETRIES = 2
+
 # rajistics/sroie (the HF source behind data/processed/SROIE) only ever
 # carries company/date/address/total per example — 0% coverage for every
 # other field across all 624 training rows, vs. the golden set's own SROIE
@@ -178,10 +184,14 @@ def _build_predictor(
             base_url=base_url or config.VLLM_BASE_URL,
             api_key=config.VLLM_API_KEY,
             model_name=model or config.SPECIALIST_MODEL,
+            timeout=_EVAL_TIMEOUT_S,
+            max_retries=_EVAL_SPECIALIST_MAX_RETRIES,
             seed=seed,
         )
     if name == "frontier":
-        return FrontierExtractor(model_name=model or config.FRONTIER_MODEL)
+        return FrontierExtractor(
+            model_name=model or config.FRONTIER_MODEL, timeout=_EVAL_TIMEOUT_S
+        )
     raise ValueError(f"Unknown extractor: {name}")
 
 

@@ -16,6 +16,8 @@ from invoice_pipeline.config import (
     SPECIALIST_MODEL,
     VLLM_API_KEY,
     VLLM_BASE_URL,
+    FRONTIER_TIMEOUT_S,
+    SPECIALIST_TIMEOUT_S,
 )
 
 
@@ -56,6 +58,10 @@ def build_graph(specialist: SpecialistExtractor, frontier: FrontierExtractor):
 
 
 graph = build_graph(
-    specialist=SpecialistExtractor(VLLM_BASE_URL, VLLM_API_KEY, SPECIALIST_MODEL),
-    frontier=FrontierExtractor(FRONTIER_MODEL, temperature=0.1),
+    specialist=SpecialistExtractor(
+        VLLM_BASE_URL, VLLM_API_KEY, SPECIALIST_MODEL, timeout=SPECIALIST_TIMEOUT_S
+    ),
+    frontier=FrontierExtractor(
+        FRONTIER_MODEL, timeout=FRONTIER_TIMEOUT_S, temperature=0.1
+    ),
 )

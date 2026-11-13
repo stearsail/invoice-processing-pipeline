@@ -22,10 +22,20 @@ class SpecialistExtractor:
         self,
         base_url: str,
         api_key: str,
-        model_name: str = "qwen3-vl-fullds-merged-r8",
+        model_name: str,
+        *,
+        timeout: float,
+        max_retries: int = 0,
         seed: int | None = None,
     ):
-        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        # max_retries defaults to 0 because in production arq owns retries —
+        # SDK retries would stack on top of them and burn the job deadline
+        self._client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=max_retries,
+            timeout=timeout,
+        )
         self._model_name = model_name
         self._seed = seed
 
@@ -84,13 +94,19 @@ class SpecialistExtractor:
 
 class FrontierExtractor:
     def __init__(
-        self, model_name: str, temperature: float | None = None, max_tokens: int = 4096
+        self,
+        model_name: str,
+        *,
+        timeout: float,
+        temperature: float | None = None,
+        max_tokens: int = 4096,
     ):
         self._client = ChatAnthropic(
             model=model_name,
             temperature=temperature if temperature else None,
             max_tokens_to_sample=max_tokens,
             max_retries=0,
+            timeout=timeout,
         )
 
     async def extract_invoice(

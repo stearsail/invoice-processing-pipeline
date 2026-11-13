@@ -85,14 +85,14 @@ def no_real_image_io(monkeypatch):
 
 def _specialist(client: MagicMock, seed: int | None = None) -> SpecialistExtractor:
     extractor = SpecialistExtractor(
-        "http://vllm.test/v1", "key", "test-model", seed=seed
+        "http://vllm.test/v1", "key", "test-model", timeout=30, seed=seed
     )
     extractor._client = client
     return extractor
 
 
 def _frontier(client: MagicMock) -> FrontierExtractor:
-    extractor = FrontierExtractor("test-model")
+    extractor = FrontierExtractor("test-model", timeout=30)
     extractor._client = client
     return extractor
 
