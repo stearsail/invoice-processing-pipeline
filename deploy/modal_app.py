@@ -15,7 +15,7 @@ MODEL_DIR = "/models/qwen3-vl-fullds-merged-r8"
 
 
 @app.function(
-    gpu="L4",
+    gpu=["L4", "A10G"],
     volumes={"/models": volume},
     secrets=[modal.Secret.from_name("vllm-api-key")],
     scaledown_window=3600,
