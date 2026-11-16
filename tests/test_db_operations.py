@@ -3,11 +3,12 @@ from typing import get_args
 from decimal import Decimal
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from invoice_pipeline.db.models import Job
+from invoice_pipeline.db.models import Job, LedgerEntry
 from invoice_pipeline.db.operations import (
     PENDING_STATUSES,
     create_job,
@@ -438,3 +439,18 @@ async def test_reaper_select_and_update_agree_on_which_statuses_are_pending(
     updatable = await mark_job_orphaned(session, job.id, "orphaned: test")
 
     assert selected == updatable
+
+
+@pytest.mark.anyio
+async def test_a_job_can_have_only_one_ledger_entry(session):
+    job = await create_job(session, file_key="once.png")
+    first = await write_entry(session, job.id, _invoice())
+    # rollback expires loaded objects, so keep plain ids
+    job_id, first_id = job.id, first.id
+
+    with pytest.raises(IntegrityError):
+        await write_entry(session, job_id, _invoice(grand_total=Decimal("99.00")))
+    await session.rollback()
+
+    result = await session.exec(select(LedgerEntry).where(LedgerEntry.job_id == job_id))
+    assert [entry.id for entry in result.all()] == [first_id]

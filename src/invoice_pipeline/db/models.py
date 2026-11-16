@@ -1,10 +1,12 @@
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
-from sqlmodel import JSON, SQLModel, Field, Column, String
+from sqlmodel import JSON, SQLModel, Field, Column, String, UniqueConstraint
 
 
 class LedgerEntry(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("job_id", name="uq_ledgerentry_job_id"),)
+
     id: int | None = Field(default=None, primary_key=True)
     invoice_number: str | None = Field(default=None, index=True)
     vendor_name: str | None = Field(default=None, index=True)
