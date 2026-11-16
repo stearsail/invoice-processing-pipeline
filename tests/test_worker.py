@@ -6,15 +6,22 @@ import pytest
 from arq import Retry
 from arq.jobs import JobStatus
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from invoice_pipeline.workflow.runner import ExtractionResult
 from invoice_pipeline import config
 from invoice_pipeline.api.routers.ledger import retry_job
-from invoice_pipeline.db.operations import create_job, query_job, update_job
+from invoice_pipeline.db.models import LedgerEntry
+from invoice_pipeline.db.operations import (
+    create_job,
+    query_job,
+    update_job,
+    write_entry,
+)
 from invoice_pipeline.queue import worker
 from invoice_pipeline.queue.jobs import arq_job_id
+from invoice_pipeline.schema import Invoice
 
 
 @pytest.fixture
@@ -378,3 +385,79 @@ async def test_process_job_deadline_on_last_try_marks_error(
 )
 def test_describe_error_never_returns_a_blank_message(exc, expected):
     assert worker._describe_error(exc) == expected
+
+
+async def _with_ledger_entry(factory, job) -> None:
+    async with factory() as session:
+        await write_entry(
+            session,
+            job.id,
+            Invoice(document_type="receipt", currency="USD", grand_total="10.00"),
+            needs_review=True,
+        )
+
+
+async def _entry_count(factory, job_id: int) -> int:
+    async with factory() as session:
+        result = await session.exec(
+            select(LedgerEntry).where(LedgerEntry.job_id == job_id)
+        )
+        return len(result.all())
+
+
+@pytest.mark.anyio
+async def test_rerun_of_a_job_with_an_entry_completes_without_extracting(
+    in_memory_session_factory, monkeypatch
+):
+    # first run wrote the entry, then its status write was lost
+    job = await _job_with_status(in_memory_session_factory, "retrying", attempts=1)
+    await _with_ledger_entry(in_memory_session_factory, job)
+    fake_run = AsyncMock()
+    monkeypatch.setattr(worker, "run_extraction", fake_run)
+
+    await worker.process_job({"job_try": 2}, job.id, job.file_key)
+
+    async with in_memory_session_factory() as session:
+        updated = await query_job(session, job.id)
+    fake_run.assert_not_awaited()
+    assert updated.status == "complete"
+    assert updated.error is None
+    assert updated.attempts == 2
+    assert await _entry_count(in_memory_session_factory, job.id) == 1
+
+
+@pytest.mark.anyio
+async def test_job_without_an_entry_still_runs_extraction(
+    in_memory_session_factory, monkeypatch
+):
+    job = await _make_job(in_memory_session_factory)
+    fake_run = AsyncMock(return_value=ExtractionResult(status="complete"))
+    monkeypatch.setattr(worker, "run_extraction", fake_run)
+
+    await worker.process_job({"job_try": 1}, job.id, job.file_key)
+
+    fake_run.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_lost_status_write_recovers_through_reap_and_retry_without_a_duplicate(
+    in_memory_session_factory, monkeypatch
+):
+    # entry written, status never updated -> reaped -> retried -> re-run
+    job = await _make_job(in_memory_session_factory)
+    await _with_ledger_entry(in_memory_session_factory, job)
+    _fake_arq(monkeypatch, {})
+    assert await worker.reap_orphaned_jobs(_CTX) == 1
+
+    async with in_memory_session_factory() as session:
+        await retry_job(job_id=job.id, session=session, pool=AsyncMock())
+    fake_run = AsyncMock()
+    monkeypatch.setattr(worker, "run_extraction", fake_run)
+    await worker.process_job({"job_try": 1}, job.id, job.file_key)
+
+    async with in_memory_session_factory() as session:
+        updated = await query_job(session, job.id)
+    fake_run.assert_not_awaited()
+    assert updated.status == "complete"
+    assert updated.error is None
+    assert await _entry_count(in_memory_session_factory, job.id) == 1
