@@ -4,6 +4,9 @@ from invoice_pipeline.db.operations import find_duplicate, write_entry
 from invoice_pipeline.util.reconciliation import ReconciliationIssue, reconcile
 from invoice_pipeline.db.engine import session_factory
 
+# only a re-read can fix these; duplicates and missing fields are facts of the document
+FRONTIER_FIXABLE_CATEGORIES = frozenset({"mismatch"})
+
 
 async def specialist_extract(specialist: SpecialistExtractor, state: State) -> dict:
     result = await specialist.extract_invoice(state["image"])
@@ -82,7 +85,11 @@ def route_after_parsing(state: State) -> str:
 def route_after_reconcile(state: State) -> str:
     if state["invoice"] is None:
         return "total_failure"
-    if state["reconciliation_issues"] and not state["frontier_attempted"]:
+    fixable = any(
+        issue.category in FRONTIER_FIXABLE_CATEGORIES
+        for issue in state["reconciliation_issues"]
+    )
+    if fixable and not state["frontier_attempted"]:
         return "retry_via_frontier"
     return "reconciled"
 

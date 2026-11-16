@@ -7,6 +7,7 @@ from invoice_pipeline.workflow import nodes, runner
 from invoice_pipeline.workflow.extractors import ExtractionResult
 from invoice_pipeline.workflow.graph import build_graph
 from invoice_pipeline.schema import Invoice, LineItem
+from invoice_pipeline.util.reconciliation import ReconciliationIssue
 
 
 def _invoice(**overrides) -> Invoice:
@@ -437,3 +438,86 @@ async def test_run_extraction_routing_and_provenance(
         assert result.status == "complete"
         assert len(no_real_ledger) == 1
         assert no_real_ledger[0]["extracted_by"] == ledger_extracted_by
+
+
+# --- review retry only for issues a re-read can fix -------------------------
+
+
+def _issue(category: str) -> ReconciliationIssue:
+    return ReconciliationIssue(category=category, message=f"{category} issue")
+
+
+@pytest.mark.parametrize(
+    "categories, frontier_attempted, expected",
+    [
+        ([], False, "reconciled"),
+        (["unverifiable"], False, "reconciled"),
+        (["duplicate"], False, "reconciled"),
+        (["unverifiable", "duplicate"], False, "reconciled"),
+        (["mismatch"], False, "retry_via_frontier"),
+        (["unverifiable", "mismatch"], False, "retry_via_frontier"),
+        (["duplicate", "mismatch"], False, "retry_via_frontier"),
+        (["mismatch"], True, "reconciled"),
+    ],
+)
+def test_route_after_reconcile_retries_only_frontier_fixable_issues(
+    categories, frontier_attempted, expected
+):
+    state = _initial_state(
+        invoice=_invoice(),
+        reconciliation_issues=[_issue(c) for c in categories],
+        frontier_attempted=frontier_attempted,
+    )
+
+    assert nodes.route_after_reconcile(state) == expected
+
+
+@pytest.mark.anyio
+async def test_duplicate_specialist_extraction_skips_the_frontier(
+    monkeypatch, no_real_ledger
+):
+    graph, _, frontier = _build(specialist_result=_extracted(_invoice()))
+
+    async def _dup(session, invoice_number, vendor_name):
+        return MagicMock(id=42)
+
+    monkeypatch.setattr(nodes, "find_duplicate", _dup)
+
+    await graph.ainvoke(_initial_state(), config=_LOOP_GUARD)
+
+    assert len(frontier.calls) == 0
+    assert no_real_ledger[0]["extracted_by"] == "specialist"
+    categories = [r["category"] for r in no_real_ledger[0]["review_reason"]]
+    assert categories == ["duplicate"]
+
+
+@pytest.mark.anyio
+async def test_receipt_without_a_subtotal_skips_the_frontier(no_real_ledger):
+    graph, _, frontier = _build(specialist_result=_extracted(_invoice(subtotal=None)))
+
+    await graph.ainvoke(_initial_state(), config=_LOOP_GUARD)
+
+    assert len(frontier.calls) == 0
+    assert no_real_ledger[0]["extracted_by"] == "specialist"
+    categories = [r["category"] for r in no_real_ledger[0]["review_reason"]]
+    assert categories == ["unverifiable"]
+
+
+@pytest.mark.anyio
+async def test_mismatch_alongside_a_duplicate_still_retries_once(
+    monkeypatch, no_real_ledger
+):
+    graph, _, frontier = _build(
+        specialist_result=_extracted(_unreconciled_invoice()),
+        frontier_result=_extracted(_invoice()),
+    )
+
+    async def _dup(session, invoice_number, vendor_name):
+        return MagicMock(id=42)
+
+    monkeypatch.setattr(nodes, "find_duplicate", _dup)
+
+    await graph.ainvoke(_initial_state(), config=_LOOP_GUARD)
+
+    assert len(frontier.calls) == 1
+    assert no_real_ledger[0]["extracted_by"] == "frontier"
