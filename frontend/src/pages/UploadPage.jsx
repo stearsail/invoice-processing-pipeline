@@ -12,6 +12,40 @@ import { StatusBadge } from '../components/JobTable'
 import Pagination from '../components/Pagination'
 
 const ERRORED_PAGE_SIZE = 20
+// keep in sync with the formats _check_content accepts in api/routers/extraction.py
+const ALLOWED_TYPES = ['image/png', 'image/jpeg']
+
+const REJECT_REASON_LABELS = {
+  unsupported_type: 'unsupported file type',
+  empty: 'empty file',
+  too_large: 'file too large',
+  type_mismatch: 'not a real PNG/JPEG',
+  unreadable_image: 'corrupt or unreadable image',
+  duplicate_in_batch: 'duplicate of another file in this upload',
+}
+
+function summarizeRejections(rejected) {
+  const counts = {}
+  for (const r of rejected) {
+    counts[r.reason] = (counts[r.reason] || 0) + 1
+  }
+  return Object.entries(counts)
+    .map(([reason, n]) => `${n} ${REJECT_REASON_LABELS[reason] ?? reason}`)
+    .join(', ')
+}
+
+function summarizeSkipped(skipped) {
+  const counts = {}
+  for (const f of skipped) {
+    const ext = f.name.includes('.') ? f.name.split('.').pop().toUpperCase() : 'no extension'
+    counts[ext] = (counts[ext] || 0) + 1
+  }
+  const breakdown = Object.entries(counts)
+    .map(([ext, n]) => `${n} ${ext}`)
+    .join(', ')
+  const noun = skipped.length === 1 ? 'file' : 'files'
+  return `Skipped ${skipped.length} ${noun}: only PNG and JPEG are supported (${breakdown}).`
+}
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
@@ -22,6 +56,7 @@ function formatSize(bytes) {
 export default function UploadPage() {
   const [files, setFiles] = useState([])
   const [error, setError] = useState(null)
+  const [rejections, setRejections] = useState([])
   const [pendingJobs, setPendingJobs] = useState(null)
   const [erroredJobs, setErroredJobs] = useState(null)
   const [busyJobId, setBusyJobId] = useState(null)
@@ -110,11 +145,13 @@ export default function UploadPage() {
   }
 
   function addFiles(fileList) {
+    const picked = Array.from(fileList)
+    const allowed = picked.filter((f) => ALLOWED_TYPES.includes(f.type))
+    const skipped = picked.filter((f) => !ALLOWED_TYPES.includes(f.type))
+    setError(skipped.length > 0 ? summarizeSkipped(skipped) : null)
     setFiles((prev) => {
       const seen = new Set(prev.map((f) => `${f.name}:${f.size}`))
-      const additions = Array.from(fileList).filter(
-        (f) => !seen.has(`${f.name}:${f.size}`)
-      )
+      const additions = allowed.filter((f) => !seen.has(`${f.name}:${f.size}`))
       return [...prev, ...additions]
     })
     // reset so picking the same file again (after removing it) still fires onChange
@@ -129,8 +166,10 @@ export default function UploadPage() {
     event.preventDefault()
     if (files.length === 0) return
     setError(null)
+    setRejections([])
     try {
-      await uploadImages(files)
+      const result = await uploadImages(files)
+      setRejections(result.rejected ?? [])
       setFiles([])
       loadJobs()
     } catch (err) {
@@ -159,7 +198,7 @@ export default function UploadPage() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/png,image/jpeg"
+          accept={ALLOWED_TYPES.join(',')}
           multiple
           onChange={(e) => addFiles(e.target.files)}
           className="hidden"
@@ -239,7 +278,41 @@ export default function UploadPage() {
         )}
       </form>
 
-      {error && <p className="mt-4 text-sm text-red-400">{error}</p>}
+      {error && (
+        <p className="mt-4 text-sm whitespace-pre-line text-red-400">{error}</p>
+      )}
+
+      {rejections.length > 0 && (
+        <div className="mt-4 max-w-2xl rounded border border-amber-500/40 px-3 py-2 text-sm">
+          <div className="flex items-start justify-between gap-3">
+            <p className="text-amber-400">
+              Skipped {rejections.length} file{rejections.length !== 1 ? 's' : ''}:{' '}
+              {summarizeRejections(rejections)}. The rest were queued.
+            </p>
+            <button
+              type="button"
+              onClick={() => setRejections([])}
+              className="shrink-0 cursor-pointer text-xs font-medium text-muted hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
+          <details className="mt-1">
+            <summary className="cursor-pointer text-xs text-muted">Show files</summary>
+            <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto">
+              {rejections.map((r, i) => (
+                <li key={`${r.filename}:${i}`} className="text-xs">
+                  <span className="text-body">{r.filename}</span>
+                  <span className="text-muted">
+                    {' '}
+                    — {REJECT_REASON_LABELS[r.reason] ?? r.reason}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        </div>
+      )}
 
       <h2 className="mt-10 mb-3 text-lg font-semibold">
         Pending jobs{pendingJobs && ` — ${pendingJobs.length}`}
