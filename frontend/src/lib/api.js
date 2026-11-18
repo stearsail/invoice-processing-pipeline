@@ -4,7 +4,15 @@ async function request(path, options) {
   const response = await fetch(`${API_BASE}${path}`, options)
   if (!response.ok) {
     const text = await response.text()
-    const error = new Error(`${response.status}: ${text}`)
+    let message = text
+    try {
+      // FastAPI errors are {"detail": "..."}; show the message, not raw JSON
+      const detail = JSON.parse(text).detail
+      if (typeof detail === 'string') message = detail
+    } catch {
+      // not JSON: keep the raw body
+    }
+    const error = new Error(`${response.status}: ${message}`)
     error.status = response.status
     throw error
   }
