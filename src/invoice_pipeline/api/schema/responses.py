@@ -6,9 +6,30 @@ from invoice_pipeline.schema import Invoice
 from invoice_pipeline.util.reconciliation import ReconciliationIssue
 
 
-class JobCreationResponse(BaseModel):
+class JobCreation(BaseModel):
     job_id: int
     status: str
+
+
+RejectReason = Literal[
+    "unsupported_type",
+    "empty",
+    "too_large",
+    "type_mismatch",
+    "unreadable_image",
+    "duplicate_in_batch",
+]
+
+
+class RejectedFile(BaseModel):
+    filename: str
+    content_type: str | None
+    reason: RejectReason
+
+
+class UploadResponse(BaseModel):
+    jobs: list[JobCreation]
+    rejected: list[RejectedFile]
 
 
 class LedgerEntryResponse(BaseModel):
