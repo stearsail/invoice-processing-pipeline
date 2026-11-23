@@ -1,10 +1,17 @@
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import anthropic
+import httpx
+import openai
 import pytest
 
-from invoice_pipeline.workflow import nodes, runner
-from invoice_pipeline.workflow.extractors import ExtractionResult
+from invoice_pipeline.workflow import extractors, nodes, runner
+from invoice_pipeline.workflow.extractors import (
+    ExtractionResult,
+    FrontierExtractor,
+    SpecialistExtractor,
+)
 from invoice_pipeline.workflow.graph import build_graph
 from invoice_pipeline.schema import Invoice, LineItem
 from invoice_pipeline.util.reconciliation import ReconciliationIssue
@@ -521,3 +528,83 @@ async def test_mismatch_alongside_a_duplicate_still_retries_once(
 
     assert len(frontier.calls) == 1
     assert no_real_ledger[0]["extracted_by"] == "frontier"
+
+
+# --- C: what the real extractors' error handling does to a document ---------
+
+_REQ = httpx.Request("POST", "http://api.test/v1")
+
+
+def _status_error(sdk, cls_name: str, code: int):
+    cls = getattr(sdk, cls_name)
+    return cls(cls_name, response=httpx.Response(code, request=_REQ), body=None)
+
+
+def _real_specialist_raising(monkeypatch, exc) -> SpecialistExtractor:
+    monkeypatch.setattr(extractors, "load_image_b64", lambda p: ("b64", "image/png"))
+    specialist = SpecialistExtractor("http://vllm.test/v1", "key", "m", timeout=5)
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(side_effect=exc)
+    specialist._client = client
+    return specialist
+
+
+def _real_frontier_raising(monkeypatch, exc) -> FrontierExtractor:
+    monkeypatch.setattr(extractors, "load_image_b64", lambda p: ("b64", "image/png"))
+    frontier = FrontierExtractor("test-model", timeout=5)
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(side_effect=exc)
+    client = MagicMock()
+    client.with_structured_output.return_value = structured
+    frontier._client = client
+    return frontier
+
+
+@pytest.mark.anyio
+async def test_specialist_rejected_request_falls_back_to_the_frontier(
+    monkeypatch, no_real_ledger
+):
+    specialist = _real_specialist_raising(
+        monkeypatch, _status_error(openai, "BadRequestError", 400)
+    )
+    frontier = _FakeExtractor(_extracted(_invoice()))
+    graph = build_graph(specialist=specialist, frontier=frontier)
+
+    await graph.ainvoke(_initial_state(), config=_LOOP_GUARD)
+
+    assert len(frontier.calls) == 1
+    assert no_real_ledger[0]["extracted_by"] == "frontier"
+
+
+@pytest.mark.anyio
+async def test_wrong_specialist_key_fails_the_run_without_paying_for_the_frontier(
+    monkeypatch, no_real_ledger
+):
+    specialist = _real_specialist_raising(
+        monkeypatch, _status_error(openai, "AuthenticationError", 401)
+    )
+    frontier = _FakeExtractor(_extracted(_invoice()))
+    graph = build_graph(specialist=specialist, frontier=frontier)
+
+    with pytest.raises(openai.AuthenticationError):
+        await graph.ainvoke(_initial_state(), config=_LOOP_GUARD)
+
+    assert frontier.calls == []
+    assert no_real_ledger == []
+
+
+@pytest.mark.anyio
+async def test_wrong_frontier_key_during_review_retry_fails_the_run(
+    monkeypatch, no_real_ledger
+):
+    # the specialist's flagged draft is not written: the job errors and is retried
+    specialist = _FakeExtractor(_extracted(_unreconciled_invoice()))
+    frontier = _real_frontier_raising(
+        monkeypatch, _status_error(anthropic, "AuthenticationError", 401)
+    )
+    graph = build_graph(specialist=specialist, frontier=frontier)
+
+    with pytest.raises(anthropic.AuthenticationError):
+        await graph.ainvoke(_initial_state(), config=_LOOP_GUARD)
+
+    assert no_real_ledger == []

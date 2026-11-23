@@ -10,7 +10,7 @@ export const CATEGORY_STYLES = {
 export const ERROR_CATEGORY_MESSAGES = {
   connectivity:
     'Temporarily unable to reach the extraction service — this usually resolves on retry.',
-  missing_file: 'The uploaded document could not be found.',
+  bad_input: 'Bad input, error decoding or identifying image file.',
   invalid_output:
     "The extracted data didn't match the expected format for one or more fields (e.g., a non-numeric value where a number was expected).",
   unknown: 'Something unexpected happened while processing this document.',

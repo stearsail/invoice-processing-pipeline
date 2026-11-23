@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -5,6 +6,8 @@ import anthropic
 import httpx
 import openai
 import pytest
+from PIL import UnidentifiedImageError
+from pydantic import ValidationError
 
 from invoice_pipeline.workflow import extractors
 from invoice_pipeline.workflow.extractors import (
@@ -308,13 +311,12 @@ async def test_frontier_returns_structured_invoice():
 
 
 @pytest.mark.anyio
-async def test_frontier_reports_parse_error_when_call_raises():
+async def test_frontier_reraises_unexpected_errors_instead_of_falling_back():
+    # an unknown failure is a bug or misconfiguration: it must reach the worker
     extractor = _frontier(_fake_frontier_client(raises=True))
 
-    result = await extractor.extract_invoice("fake.png")
-
-    assert result.invoice is None
-    assert result.parse_error.startswith("unknown:")
+    with pytest.raises(RuntimeError, match="frontier boom"):
+        await extractor.extract_invoice("fake.png")
 
 
 @pytest.mark.anyio
@@ -343,3 +345,124 @@ async def test_frontier_appends_extra_context_to_prompt():
     sent = client.with_structured_output.return_value.ainvoke.await_args.args[0][0]
     prompt = sent["content"][0]["text"]
     assert "issues: grand total mismatch" in prompt
+
+
+_REQ = httpx.Request("POST", "http://api.test/v1")
+
+
+def _status_error(sdk, cls_name: str, code: int):
+    cls = getattr(sdk, cls_name)
+    return cls(cls_name, response=httpx.Response(code, request=_REQ), body=None)
+
+
+def _frontier_raising(exc: Exception) -> FrontierExtractor:
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(side_effect=exc)
+    client = MagicMock()
+    client.with_structured_output.return_value = structured
+    return _frontier(client)
+
+
+def _frontier_returning_parse_error(error: Exception) -> FrontierExtractor:
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(
+        return_value={
+            "raw": MagicMock(content="not an invoice"),
+            "parsed": None,
+            "parsing_error": error,
+        }
+    )
+    client = MagicMock()
+    client.with_structured_output.return_value = structured
+    return _frontier(client)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _status_error(openai, "AuthenticationError", 401),
+        TypeError("bug building the request"),
+    ],
+    ids=["wrong_api_key", "bug"],
+)
+async def test_specialist_reraises_unknown_errors(exc):
+    extractor = _specialist(_fake_specialist_client_raising(exc))
+
+    with pytest.raises(type(exc)):
+        await extractor.extract_invoice("fake.png")
+
+
+@pytest.mark.anyio
+async def test_specialist_rejected_request_becomes_a_logged_parse_error(caplog):
+    # e.g. vLLM refusing a request over --max-model-len: the frontier may still read it
+    exc = _status_error(openai, "BadRequestError", 400)
+    extractor = _specialist(_fake_specialist_client_raising(exc))
+
+    with caplog.at_level(logging.WARNING, logger=extractors.__name__):
+        result = await extractor.extract_invoice("fake.png")
+
+    assert result.invoice is None
+    assert result.parse_error.startswith("rejected_input:")
+    assert "Specialist failed before responding (rejected_input)" in caplog.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "exc",
+    [FileNotFoundError("gone.png"), UnidentifiedImageError("cannot identify")],
+    ids=["missing", "undecodable"],
+)
+async def test_specialist_unusable_image_becomes_a_logged_parse_error(
+    monkeypatch, caplog, exc
+):
+    def _broken_image(path):
+        raise exc
+
+    monkeypatch.setattr(extractors, "load_image_b64", _broken_image)
+    client = _fake_specialist_client("{}")
+    extractor = _specialist(client)
+
+    with caplog.at_level(logging.WARNING, logger=extractors.__name__):
+        result = await extractor.extract_invoice("fake.png")
+
+    assert result.parse_error.startswith("bad_input:")
+    assert "Specialist failed before responding (bad_input)" in caplog.text
+    # the model is never called for an image that can't be loaded
+    client.chat.completions.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_frontier_reraises_a_wrong_api_key():
+    extractor = _frontier_raising(_status_error(anthropic, "AuthenticationError", 401))
+
+    with pytest.raises(anthropic.AuthenticationError):
+        await extractor.extract_invoice("fake.png")
+
+
+@pytest.mark.anyio
+async def test_frontier_rejected_request_becomes_a_logged_parse_error(caplog):
+    extractor = _frontier_raising(_status_error(anthropic, "BadRequestError", 400))
+
+    with caplog.at_level(logging.WARNING, logger=extractors.__name__):
+        result = await extractor.extract_invoice("fake.png")
+
+    assert result.invoice is None
+    assert result.parse_error.startswith("rejected_input:")
+    assert "Frontier failed before responding (rejected_input)" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_frontier_output_parse_failure_reports_its_real_category(caplog):
+    try:
+        Invoice.model_validate({})
+    except ValidationError as e:
+        schema_error = e
+    extractor = _frontier_returning_parse_error(schema_error)
+
+    with caplog.at_level(logging.WARNING, logger=extractors.__name__):
+        result = await extractor.extract_invoice("fake.png")
+
+    assert result.parse_error.startswith("invalid_output:")
+    # pytest raises on a broken format string, so this also guards the %s
+    assert "Extraction parse failure (invalid_output)" in caplog.text

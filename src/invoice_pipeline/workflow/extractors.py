@@ -81,13 +81,17 @@ class SpecialistExtractor:
             )
         except Exception as e:
             category = categorize_error(e)
-            if category == "connectivity":
+            if category == "connectivity" or category == "unknown":
                 raise
             if response is not None:
                 logger.warning(
                     "Extraction parse failure (%s): raw=%r",
                     category,
                     response.choices[0].message.content[:2000],
+                )
+            else:
+                logger.warning(
+                    "Specialist failed before responding (%s): %s", category, e
                 )
             return ExtractionResult(invoice=None, parse_error=f"{category}: {e}")
 
@@ -137,16 +141,17 @@ class FrontierExtractor:
             result = await structured_model.ainvoke([message])
         except Exception as e:
             category = categorize_error(e)
-            if category == "connectivity":
+            if category == "connectivity" or category == "unknown":
                 raise
+            logger.warning("Frontier failed before responding (%s): %s", category, e)
             return ExtractionResult(invoice=None, parse_error=f"{category}: {e}")
         if result["parsing_error"] is not None:
             category = categorize_error(result["parsing_error"])
             raw_text = result["raw"].content if result.get("raw") else None
             logger.warning(
-                "Extraction parse failure (unknown): raw=%r", str(raw_text)[:2000]
+                "Extraction parse failure (%s): raw=%r", category, str(raw_text)[:2000]
             )
             return ExtractionResult(
-                invoice=None, parse_error=f"unknown:{result['parsing_error']}"
+                invoice=None, parse_error=f"{category}: {result['parsing_error']}"
             )
         return ExtractionResult(invoice=result["parsed"], parse_error=None)

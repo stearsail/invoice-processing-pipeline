@@ -1,36 +1,47 @@
 import json
+from PIL import UnidentifiedImageError
 import sqlalchemy.exc
 import anthropic
 import openai
 from pydantic import ValidationError
 
-# exceptions worth retrying the identical call for — network issues where a later attempt might succeed
+# transient failures (API, extraction deadline, DB) where a later attempt can succeed
 _RETRYABLE_EXCEPTIONS = (
     openai.APIConnectionError,  # covers APITimeoutError too (subclass)
     openai.RateLimitError,
     openai.InternalServerError,
-    openai.NotFoundError,
     anthropic.APIConnectionError,  # covers APITimeoutError too (subclass)
     anthropic.RateLimitError,
     anthropic.InternalServerError,
     anthropic.OverloadedError,
     TimeoutError,
     sqlalchemy.exc.OperationalError,
+    # would be used to cover Modal app redeployments or the case where vLLM isn't serving the right model
+    # reaper and retry handle it eitherway
+    # openai.NotFoundError,
+)
+
+_FILE_EXCEPTIONS = (
+    FileNotFoundError,
+    UnidentifiedImageError,
 )
 
 
 def categorize_error(exc: Exception) -> str:
-    """Classify an extraction failure as retryable ("connectivity") or not.
-    Retryable failures should propagate uncaught so Arq's own retry/backoff
-    handles them, since a later attempt at the identical call can succeed.
-    Everything else (bad input, malformed request, missing file, model output
-    that fails validation) will fail identically no matter how many times you
-    retry the same call — those get reported instead.
+    """Decide who handles a failure.
+
+    "connectivity" (transient) and "unknown" (bugs, misconfiguration) propagate
+    to the worker, which retries the former and fails the latter fast.
+    "bad_input", "invalid_output" and "rejected_input" mean this model couldn't
+    read this document: extractors return them as a parse_error so the graph
+    can fall back or send the document to review.
     """
     if isinstance(exc, _RETRYABLE_EXCEPTIONS):
         return "connectivity"
-    if isinstance(exc, FileNotFoundError):
-        return "missing_file"
+    if isinstance(exc, _FILE_EXCEPTIONS):
+        return "bad_input"
     if isinstance(exc, (ValidationError, json.JSONDecodeError)):
         return "invalid_output"
+    if isinstance(exc, (anthropic.BadRequestError, openai.BadRequestError)):
+        return "rejected_input"
     return "unknown"

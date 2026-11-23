@@ -120,6 +120,9 @@ _NOT_RETRYABLE = {
     "bug_key": KeyError("ledger_entry_id"),
     "duplicate_entry": IntegrityError("INSERT", {}, Exception("uq_ledgerentry_job_id")),
     "unexpected": RuntimeError("something unexpected"),
+    "wrong_api_key": openai.AuthenticationError(
+        "invalid key", response=httpx.Response(401, request=_REQUEST), body=None
+    ),
 }
 
 

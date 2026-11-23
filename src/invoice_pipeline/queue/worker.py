@@ -64,7 +64,10 @@ async def process_job(ctx, job_id, file_key):
         async with asyncio.timeout(EXTRACTION_DEADLINE_S):
             result = await _run_extraction_job(job_id, file_key)
     except Exception as e:
-        if ctx["job_try"] < WorkerSettings.max_tries and categorize_error(e)=="connectivity":
+        if (
+            ctx["job_try"] < WorkerSettings.max_tries
+            and categorize_error(e) == "connectivity"
+        ):
             async with session_factory() as session:
                 try:
                     await update_job(
@@ -75,10 +78,14 @@ async def process_job(ctx, job_id, file_key):
                         attempts_update=ctx["job_try"],
                     )
                 except OperationalError:
-                    logger.exception("Could not record retrying status for job %s", job_id)
+                    logger.exception(
+                        "Could not record retrying status for job %s", job_id
+                    )
             raise Retry(defer=ctx["job_try"] * 20)
         else:
-            logger.exception("Extraction job %s failed permanently", job_id)
+            logger.exception(
+                "Extraction job %s failed permanently, reason: %s", job_id, e
+            )
             await _set_status(
                 job_id,
                 status="error",
