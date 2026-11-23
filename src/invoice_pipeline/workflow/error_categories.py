@@ -1,5 +1,5 @@
 import json
-
+import sqlalchemy.exc
 import anthropic
 import openai
 from pydantic import ValidationError
@@ -14,6 +14,8 @@ _RETRYABLE_EXCEPTIONS = (
     anthropic.RateLimitError,
     anthropic.InternalServerError,
     anthropic.OverloadedError,
+    TimeoutError,
+    sqlalchemy.exc.OperationalError,
 )
 
 

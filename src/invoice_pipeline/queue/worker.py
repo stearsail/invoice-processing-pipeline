@@ -3,6 +3,8 @@ import asyncio
 from arq import Retry, cron
 from arq.connections import RedisSettings
 from arq.jobs import Job as ArqJob, JobStatus
+from sqlalchemy.exc import OperationalError
+from invoice_pipeline.workflow.error_categories import categorize_error
 from invoice_pipeline import config
 import logging
 from invoice_pipeline.workflow.runner import run_extraction
@@ -62,15 +64,18 @@ async def process_job(ctx, job_id, file_key):
         async with asyncio.timeout(EXTRACTION_DEADLINE_S):
             result = await _run_extraction_job(job_id, file_key)
     except Exception as e:
-        if ctx["job_try"] < WorkerSettings.max_tries:
+        if ctx["job_try"] < WorkerSettings.max_tries and categorize_error(e)=="connectivity":
             async with session_factory() as session:
-                await update_job(
-                    session,
-                    job_id=job_id,
-                    status_update="retrying",
-                    error_update=_describe_error(e),
-                    attempts_update=ctx["job_try"],
-                )
+                try:
+                    await update_job(
+                        session,
+                        job_id=job_id,
+                        status_update="retrying",
+                        error_update=_describe_error(e),
+                        attempts_update=ctx["job_try"],
+                    )
+                except OperationalError:
+                    logger.exception("Could not record retrying status for job %s", job_id)
             raise Retry(defer=ctx["job_try"] * 20)
         else:
             logger.exception("Extraction job %s failed permanently", job_id)

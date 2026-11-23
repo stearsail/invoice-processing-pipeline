@@ -2,9 +2,13 @@ import asyncio
 import logging
 from unittest.mock import AsyncMock
 
+import anthropic
+import httpx
+import openai
 import pytest
 from arq import Retry
 from arq.jobs import JobStatus
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -101,16 +105,35 @@ async def test_process_job_marks_extraction_failed_when_no_invoice_extracted(
     assert "Extraction failed entirely" in updated.error
 
 
+_REQUEST = httpx.Request("POST", "http://vllm.test/v1/chat/completions")
+
+_RETRYABLE = {
+    "specialist_unreachable": openai.APIConnectionError(request=_REQUEST),
+    "specialist_timeout": openai.APITimeoutError(request=_REQUEST),
+    "frontier_unreachable": anthropic.APIConnectionError(request=_REQUEST),
+    "deadline": TimeoutError(),
+    "db_down": OperationalError("SELECT 1", {}, Exception("connection refused")),
+}
+
+_NOT_RETRYABLE = {
+    "bug": TypeError("missing 1 required positional argument"),
+    "bug_key": KeyError("ledger_entry_id"),
+    "duplicate_entry": IntegrityError("INSERT", {}, Exception("uq_ledgerentry_job_id")),
+    "unexpected": RuntimeError("something unexpected"),
+}
+
+
+def _failing_extraction(monkeypatch, exc):
+    monkeypatch.setattr(worker, "run_extraction", AsyncMock(side_effect=exc))
+
+
 @pytest.mark.anyio
-async def test_process_job_retries_when_tries_remain(
-    in_memory_session_factory, monkeypatch
+@pytest.mark.parametrize("exc", _RETRYABLE.values(), ids=_RETRYABLE.keys())
+async def test_process_job_retries_transient_failures_while_tries_remain(
+    in_memory_session_factory, monkeypatch, exc
 ):
     job = await _make_job(in_memory_session_factory)
-    monkeypatch.setattr(
-        worker,
-        "run_extraction",
-        AsyncMock(side_effect=RuntimeError("vllm connection refused")),
-    )
+    _failing_extraction(monkeypatch, exc)
 
     with pytest.raises(Retry):
         await worker.process_job({"job_try": 1}, job.id, job.file_key)
@@ -119,19 +142,35 @@ async def test_process_job_retries_when_tries_remain(
         updated = await query_job(session, job.id)
     assert updated.status == "retrying"
     assert updated.attempts == 1
-    assert "vllm connection refused" in updated.error
+    assert updated.error.startswith(type(exc).__name__)
 
 
 @pytest.mark.anyio
-async def test_process_job_marks_error_when_tries_exhausted(
+@pytest.mark.parametrize("exc", _NOT_RETRYABLE.values(), ids=_NOT_RETRYABLE.keys())
+async def test_process_job_fails_fast_on_non_transient_errors(
+    in_memory_session_factory, monkeypatch, caplog, exc
+):
+    job = await _make_job(in_memory_session_factory)
+    _failing_extraction(monkeypatch, exc)
+
+    # first try, tries remain: must not retry
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        await worker.process_job({"job_try": 1}, job.id, job.file_key)
+
+    async with in_memory_session_factory() as session:
+        updated = await query_job(session, job.id)
+    assert updated.status == "error"
+    assert updated.attempts == 1
+    assert updated.error.startswith(type(exc).__name__)
+    assert "failed permanently" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_process_job_marks_error_when_tries_are_exhausted(
     in_memory_session_factory, monkeypatch
 ):
     job = await _make_job(in_memory_session_factory)
-    monkeypatch.setattr(
-        worker,
-        "run_extraction",
-        AsyncMock(side_effect=RuntimeError("vllm connection refused")),
-    )
+    _failing_extraction(monkeypatch, _RETRYABLE["specialist_unreachable"])
     last_try = worker.WorkerSettings.max_tries
 
     await worker.process_job({"job_try": last_try}, job.id, job.file_key)
@@ -140,7 +179,37 @@ async def test_process_job_marks_error_when_tries_exhausted(
         updated = await query_job(session, job.id)
     assert updated.status == "error"
     assert updated.attempts == last_try
-    assert "vllm connection refused" in updated.error
+    assert updated.error.startswith("APIConnectionError")
+
+
+@pytest.mark.anyio
+async def test_process_job_still_retries_when_the_retrying_write_hits_a_dead_db(
+    in_memory_session_factory, monkeypatch, caplog
+):
+    job = await _make_job(in_memory_session_factory)
+    _failing_extraction(monkeypatch, _RETRYABLE["db_down"])
+    monkeypatch.setattr(
+        worker, "update_job", AsyncMock(side_effect=_RETRYABLE["db_down"])
+    )
+
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        with pytest.raises(Retry):
+            await worker.process_job({"job_try": 1}, job.id, job.file_key)
+
+    assert f"Could not record retrying status for job {job.id}" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_process_job_does_not_swallow_a_non_db_error_from_the_retrying_write(
+    in_memory_session_factory, monkeypatch
+):
+    # only a dead DB is tolerated there; anything else is a bug and must surface
+    job = await _make_job(in_memory_session_factory)
+    _failing_extraction(monkeypatch, _RETRYABLE["specialist_unreachable"])
+    monkeypatch.setattr(worker, "update_job", AsyncMock(side_effect=TypeError("bug")))
+
+    with pytest.raises(TypeError):
+        await worker.process_job({"job_try": 1}, job.id, job.file_key)
 
 
 def _fake_arq(monkeypatch, statuses: dict[str, JobStatus], on_status=None):
