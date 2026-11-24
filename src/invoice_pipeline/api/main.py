@@ -1,6 +1,12 @@
+import logging
 from arq.connections import RedisSettings
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from sqlalchemy.exc import OperationalError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.exceptions import ConnectionError as RedisConnectionError
 from invoice_pipeline import config
 from invoice_pipeline.api.routers.extraction import router as extraction_router
 from invoice_pipeline.api.routers.ledger import router as ledger_router
@@ -9,6 +15,7 @@ from invoice_pipeline.logging_config import setup_logging
 from arq import create_pool
 
 setup_logging()
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -40,5 +47,27 @@ async def root():
     return {"message": "Hello!"}
 
 
+_OUTAGE_MESSAGES = {
+    OperationalError: "Database is unavailable",
+    PoolTimeoutError: "Database is unavailable",
+    RedisTimeoutError: "Queue is unavailable",
+    RedisConnectionError: "Queue is unavailable",
+}
+
+
+async def backend_exception_handler(request: Request, exc: Exception):
+    for cls, msg in _OUTAGE_MESSAGES.items():
+        if isinstance(exc, cls):
+            logger.warning(
+                "%s: %s %s %s", msg, request.method, request.url.path, repr(exc)
+            )
+            return JSONResponse(
+                content={"detail": msg},
+                status_code=503,
+            )
+
+
+for cls in _OUTAGE_MESSAGES.keys():
+    app.add_exception_handler(cls, backend_exception_handler)
 app.include_router(extraction_router)
 app.include_router(ledger_router)
