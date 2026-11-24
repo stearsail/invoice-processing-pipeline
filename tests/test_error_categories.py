@@ -51,6 +51,7 @@ _CASES = [
     ("openai_wrong_key", _status(openai, "AuthenticationError", 401), "unknown"),
     ("anthropic_wrong_key", _status(anthropic, "AuthenticationError", 401), "unknown"),
     ("openai_403", _status(openai, "PermissionDeniedError", 403), "unknown"),
+    ("openai_404_wrong_model", _status(openai, "NotFoundError", 404), "unknown"),
     ("bug_type", TypeError("bad call"), "unknown"),
     ("bug_key", KeyError("missing"), "unknown"),
 ]
