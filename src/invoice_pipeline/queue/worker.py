@@ -15,7 +15,12 @@ from invoice_pipeline.db.operations import (
     query_pending_jobs,
     update_job,
 )
-from invoice_pipeline.config import UPLOADS_DIR, JOB_TIMEOUT_S, EXTRACTION_DEADLINE_S
+from invoice_pipeline.config import (
+    UPLOADS_DIR,
+    JOB_TIMEOUT_S,
+    EXTRACTION_DEADLINE_S,
+    WORKER_HEALTH_CHECK_INTERVAL_S,
+)
 from invoice_pipeline.queue.jobs import arq_job_id
 
 logger = logging.getLogger(__name__)
@@ -127,3 +132,4 @@ class WorkerSettings:
     max_tries = 3
     keep_result = 0
     job_timeout = JOB_TIMEOUT_S
+    health_check_interval = WORKER_HEALTH_CHECK_INTERVAL_S

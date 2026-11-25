@@ -17,7 +17,6 @@ _RETRYABLE_EXCEPTIONS = (
     TimeoutError,
     sqlalchemy.exc.OperationalError,
     sqlalchemy.exc.TimeoutError,
-
 )
 
 _FILE_EXCEPTIONS = (
