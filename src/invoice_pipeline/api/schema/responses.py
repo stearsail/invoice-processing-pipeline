@@ -5,6 +5,13 @@ from pydantic import BaseModel, ConfigDict
 from invoice_pipeline.schema import Invoice
 from invoice_pipeline.util.reconciliation import ReconciliationIssue
 
+HealthStatus = Literal["ok", "unavailable"]
+
+
+class HealthResponse(BaseModel):
+    database: HealthStatus
+    redis: HealthStatus
+
 
 class JobCreation(BaseModel):
     job_id: int

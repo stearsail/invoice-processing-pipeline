@@ -18,6 +18,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
   redis:
     image: redis:latest
     volumes:
@@ -29,6 +30,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
   worker:
     build: .
     volumes:
@@ -45,7 +47,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-
+    restart: unless-stopped
   backend:
     build: .
     volumes:
@@ -59,7 +61,7 @@ services:
     env_file:
       - .env
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -70,6 +72,7 @@ services:
         condition: service_healthy
       # vllm:
       #   condition: service_healthy
+    restart: unless-stopped
   frontend:
     build: ./frontend
     volumes:
@@ -80,6 +83,7 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    restart: unless-stopped
   # vllm:
   #   image: vllm/vllm-openai:v0.19.1
   #   volumes:

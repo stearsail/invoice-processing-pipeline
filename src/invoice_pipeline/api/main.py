@@ -8,6 +8,7 @@ from sqlalchemy.exc import OperationalError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from invoice_pipeline import config
+from invoice_pipeline.api.routers.health import router as health_router
 from invoice_pipeline.api.routers.extraction import router as extraction_router
 from invoice_pipeline.api.routers.ledger import router as ledger_router
 from contextlib import asynccontextmanager
@@ -71,3 +72,4 @@ for cls in _OUTAGE_MESSAGES.keys():
     app.add_exception_handler(cls, backend_exception_handler)
 app.include_router(extraction_router)
 app.include_router(ledger_router)
+app.include_router(health_router)
