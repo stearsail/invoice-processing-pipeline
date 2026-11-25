@@ -16,9 +16,8 @@ _RETRYABLE_EXCEPTIONS = (
     anthropic.OverloadedError,
     TimeoutError,
     sqlalchemy.exc.OperationalError,
-    # would be used to cover Modal app redeployments or the case where vLLM isn't serving the right model
-    # reaper and retry handle it eitherway
-    # openai.NotFoundError,
+    sqlalchemy.exc.TimeoutError,
+
 )
 
 _FILE_EXCEPTIONS = (

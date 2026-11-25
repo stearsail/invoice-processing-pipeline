@@ -7,6 +7,7 @@ import pytest
 from PIL import UnidentifiedImageError
 from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from invoice_pipeline.schema import Invoice
 from invoice_pipeline.workflow.error_categories import categorize_error
@@ -40,6 +41,7 @@ _CASES = [
     ("anthropic_529", _status(anthropic, "OverloadedError", 529), "connectivity"),
     ("deadline", TimeoutError(), "connectivity"),
     ("db_down", OperationalError("SELECT 1", {}, Exception("down")), "connectivity"),
+    ("db_pool_exhausted", PoolTimeoutError("QueuePool limit reached"), "connectivity"),
     # this document can't be read by this model: fall back / review
     ("missing_image", FileNotFoundError("gone.png"), "bad_input"),
     ("undecodable_image", UnidentifiedImageError("cannot identify"), "bad_input"),
