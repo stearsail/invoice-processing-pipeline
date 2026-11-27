@@ -2,6 +2,8 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+
+from pydantic import ValidationError
 from invoice_pipeline.workflow.error_categories import categorize_error
 from invoice_pipeline.workflow.images import load_image_b64
 from invoice_pipeline.schema import Invoice, WireInvoice
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 class ExtractionResult:
     invoice: Invoice | None
     parse_error: str | None
+    model_name: str
+    raw_output: str | None
 
 
 class SpecialistExtractor:
@@ -78,22 +82,33 @@ class SpecialistExtractor:
                     json.loads(response.choices[0].message.content)
                 ),
                 parse_error=None,
+                model_name=self._model_name,
+                raw_output=response.choices[0].message.content,
             )
         except Exception as e:
             category = categorize_error(e)
             if category == "connectivity" or category == "unknown":
                 raise
             if response is not None:
+                raw_text = response.choices[0].message.content
                 logger.warning(
                     "Extraction parse failure (%s): raw=%r",
                     category,
-                    response.choices[0].message.content[:2000],
+                    raw_text[:2000],
                 )
+
             else:
+                raw_text = None
                 logger.warning(
                     "Specialist failed before responding (%s): %s", category, e
                 )
-            return ExtractionResult(invoice=None, parse_error=f"{category}: {e}")
+
+            return ExtractionResult(
+                invoice=None,
+                parse_error=f"{category}: {e}",
+                model_name=self._model_name,
+                raw_output=raw_text,
+            )
 
 
 class FrontierExtractor:
@@ -112,6 +127,7 @@ class FrontierExtractor:
             max_retries=0,
             timeout=timeout,
         )
+        self._model_name = model_name
 
     async def extract_invoice(
         self, img_path: str, extra_context: str = ""
@@ -136,7 +152,7 @@ class FrontierExtractor:
                 ],
             }
             structured_model = self._client.with_structured_output(
-                Invoice, include_raw=True
+                WireInvoice, method="json_schema", include_raw=True
             )
             result = await structured_model.ainvoke([message])
         except Exception as e:
@@ -144,14 +160,33 @@ class FrontierExtractor:
             if category == "connectivity" or category == "unknown":
                 raise
             logger.warning("Frontier failed before responding (%s): %s", category, e)
-            return ExtractionResult(invoice=None, parse_error=f"{category}: {e}")
-        if result["parsing_error"] is not None:
-            category = categorize_error(result["parsing_error"])
-            raw_text = result["raw"].content if result.get("raw") else None
+            return ExtractionResult(
+                invoice=None,
+                parse_error=f"{category}: {e}",
+                model_name=self._model_name,
+                raw_output=None,
+            )
+        # parse raw text ourselves: langchain's parser fails with OutputParserException, which categorizes as "unknown"
+        raw_text = result["raw"].text
+        try:
+            invoice = Invoice.model_validate(json.loads(raw_text))
+        except (json.JSONDecodeError, ValidationError) as e:
+            category = categorize_error(e)
             logger.warning(
-                "Extraction parse failure (%s): raw=%r", category, str(raw_text)[:2000]
+                "Extraction parse failure (%s, stop_reason=%s): raw=%r",
+                category,
+                result["raw"].response_metadata.get("stop_reason"),
+                raw_text[:2000],
             )
             return ExtractionResult(
-                invoice=None, parse_error=f"{category}: {result['parsing_error']}"
+                invoice=None,
+                parse_error=f"{category}: {e}",
+                model_name=self._model_name,
+                raw_output=raw_text,
             )
-        return ExtractionResult(invoice=result["parsed"], parse_error=None)
+        return ExtractionResult(
+            invoice=invoice,
+            parse_error=None,
+            model_name=self._model_name,
+            raw_output=raw_text,
+        )

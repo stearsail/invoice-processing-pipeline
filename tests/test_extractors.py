@@ -7,6 +7,8 @@ import httpx
 import openai
 import pytest
 from PIL import UnidentifiedImageError
+from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
 from invoice_pipeline.workflow import extractors
@@ -53,6 +55,27 @@ def _fake_specialist_client_raising(exc: Exception) -> MagicMock:
     return fake_client
 
 
+def _text_message(text: str, stop_reason: str = "end_turn") -> AIMessage:
+    # the shape Claude returns for json_schema structured output: JSON as a text block
+    return AIMessage(
+        content=[{"type": "text", "text": text}],
+        response_metadata={"stop_reason": stop_reason},
+    )
+
+
+def _structured_reply(text: str, stop_reason: str = "end_turn") -> dict:
+    # what with_structured_output(..., include_raw=True) returns, including langchain's own parse
+    try:
+        parsed, parsing_error = WireInvoice.model_validate_json(text), None
+    except ValidationError as e:
+        parsed, parsing_error = None, OutputParserException(str(e))
+    return {
+        "raw": _text_message(text, stop_reason),
+        "parsed": parsed,
+        "parsing_error": parsing_error,
+    }
+
+
 def _fake_frontier_client(
     invoice: Invoice | None = None, raises: bool = False
 ) -> MagicMock:
@@ -60,14 +83,8 @@ def _fake_frontier_client(
     if raises:
         structured.ainvoke = AsyncMock(side_effect=RuntimeError("frontier boom"))
     else:
-        # with_structured_output(..., include_raw=True) returns this dict shape,
-        # not the parsed model directly.
         structured.ainvoke = AsyncMock(
-            return_value={
-                "raw": MagicMock(),
-                "parsed": invoice,
-                "parsing_error": None,
-            }
+            return_value=_structured_reply(invoice.model_dump_json())
         )
     fake_client = MagicMock()
     fake_client.with_structured_output.return_value = structured
@@ -108,6 +125,8 @@ async def test_specialist_parses_valid_json_into_invoice():
     result = await extractor.extract_invoice("fake.png")
 
     assert result.parse_error is None
+    # our own parse of the raw text, not langchain's WireInvoice
+    assert type(result.invoice) is Invoice
     assert result.invoice == invoice
 
 
@@ -363,15 +382,9 @@ def _frontier_raising(exc: Exception) -> FrontierExtractor:
     return _frontier(client)
 
 
-def _frontier_returning_parse_error(error: Exception) -> FrontierExtractor:
+def _frontier_replying(text: str, stop_reason: str = "end_turn") -> FrontierExtractor:
     structured = MagicMock()
-    structured.ainvoke = AsyncMock(
-        return_value={
-            "raw": MagicMock(content="not an invoice"),
-            "parsed": None,
-            "parsing_error": error,
-        }
-    )
+    structured.ainvoke = AsyncMock(return_value=_structured_reply(text, stop_reason))
     client = MagicMock()
     client.with_structured_output.return_value = structured
     return _frontier(client)
@@ -453,16 +466,135 @@ async def test_frontier_rejected_request_becomes_a_logged_parse_error(caplog):
 
 
 @pytest.mark.anyio
-async def test_frontier_output_parse_failure_reports_its_real_category(caplog):
-    try:
-        Invoice.model_validate({})
-    except ValidationError as e:
-        schema_error = e
-    extractor = _frontier_returning_parse_error(schema_error)
+async def test_frontier_requests_claude_structured_output_with_the_wire_schema():
+    client = _fake_frontier_client(_invoice())
+
+    await _frontier(client).extract_invoice("fake.png")
+
+    client.with_structured_output.assert_called_once_with(
+        WireInvoice, method="json_schema", include_raw=True
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("not json at all", id="not-json"),
+        pytest.param('{"document_type": "receipt"}', id="missing-fields"),
+        pytest.param(
+            '{"document_type": "receipt", "currency": "EUR", "grand_total": "12,50"}',
+            id="locale-formatted-amount",
+        ),
+    ],
+)
+async def test_frontier_unparseable_reply_becomes_a_parse_error_not_an_exception(
+    text, caplog
+):
+    # regression guard: langchain's OutputParserException categorizes as "unknown",
+    # which would raise and error the job instead of sending it to review
+    extractor = _frontier_replying(text)
+
+    with caplog.at_level(logging.WARNING, logger=extractors.__name__):
+        result = await extractor.extract_invoice("fake.png")
+
+    assert result.invoice is None
+    assert result.parse_error.startswith("invalid_output:")
+    assert result.raw_output == text
+    # pytest raises on a broken format string, so this also guards the %s
+    assert "Extraction parse failure (invalid_output" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_frontier_truncated_reply_logs_why_claude_stopped(caplog):
+    truncated = '{"document_type": "receipt", "curr'
+    extractor = _frontier_replying(truncated, stop_reason="max_tokens")
 
     with caplog.at_level(logging.WARNING, logger=extractors.__name__):
         result = await extractor.extract_invoice("fake.png")
 
     assert result.parse_error.startswith("invalid_output:")
-    # pytest raises on a broken format string, so this also guards the %s
-    assert "Extraction parse failure (invalid_output)" in caplog.text
+    assert result.raw_output == truncated
+    assert "stop_reason=max_tokens" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_frontier_keeps_money_exact_from_string_amounts():
+    text = (
+        '{"document_type": "receipt", "currency": "KWD", "grand_total": "20.125",'
+        ' "line_items": [{"description": "x", "line_total": "20.125"}]}'
+    )
+
+    result = await _frontier_replying(text).extract_invoice("fake.png")
+
+    assert result.invoice.grand_total == Decimal("20.125")
+    assert str(result.invoice.line_items[0].line_total) == "20.125"
+
+
+# --- model name and raw output, stored on every Extraction row ---
+
+
+@pytest.mark.anyio
+async def test_specialist_keeps_raw_text_and_model_on_success():
+    raw = _invoice().model_dump_json()
+    extractor = _specialist(_fake_specialist_client(raw))
+
+    result = await extractor.extract_invoice("fake.png")
+
+    assert result.raw_output == raw
+    assert result.model_name == "test-model"
+
+
+@pytest.mark.anyio
+async def test_specialist_keeps_raw_text_when_parsing_fails():
+    # the raw reply is the only evidence of what went wrong
+    extractor = _specialist(_fake_specialist_client("not valid json"))
+
+    result = await extractor.extract_invoice("fake.png")
+
+    assert result.invoice is None
+    assert result.raw_output == "not valid json"
+    assert result.model_name == "test-model"
+
+
+@pytest.mark.anyio
+async def test_specialist_has_no_raw_output_when_no_reply_arrived():
+    extractor = _specialist(
+        _fake_specialist_client_raising(_status_error(openai, "BadRequestError", 400))
+    )
+
+    result = await extractor.extract_invoice("fake.png")
+
+    assert result.parse_error.startswith("rejected_input:")
+    assert result.raw_output is None
+    assert result.model_name == "test-model"
+
+
+@pytest.mark.anyio
+async def test_frontier_raw_output_is_exactly_the_text_claude_returned():
+    # content is a list of blocks: str(content) would store a Python repr instead
+    text = _invoice(vendor=None).model_dump_json()
+
+    result = await _frontier_replying(text).extract_invoice("fake.png")
+
+    assert result.raw_output == text
+    assert result.model_name == "test-model"
+
+
+@pytest.mark.anyio
+async def test_frontier_has_no_raw_output_when_no_reply_arrived():
+    extractor = _frontier_raising(_status_error(anthropic, "BadRequestError", 400))
+
+    result = await extractor.extract_invoice("fake.png")
+
+    assert result.raw_output is None
+    assert result.model_name == "test-model"
+
+
+@pytest.mark.anyio
+async def test_frontier_connectivity_error_still_propagates_for_retry():
+    # guards against touching `result` in the except block (UnboundLocalError)
+    exc = anthropic.APIConnectionError(request=_REQ)
+
+    with pytest.raises(anthropic.APIConnectionError):
+        await _frontier_raising(exc).extract_invoice("fake.png")

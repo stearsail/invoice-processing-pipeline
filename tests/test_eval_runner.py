@@ -53,7 +53,11 @@ async def test_evaluate_scores_successful_extractions():
     gold = _invoice()
     record = GoldRecord(source="fatura", gold=gold, image_path=Path("a.png"))
     predictor = _FakePredictor(
-        {"a.png": ExtractionResult(invoice=gold, parse_error=None)}
+        {
+            "a.png": ExtractionResult(
+                invoice=gold, parse_error=None, model_name="m", raw_output=None
+            )
+        }
     )
 
     run = await evaluate(predictor, [record])
@@ -69,7 +73,14 @@ async def test_evaluate_scores_successful_extractions():
 async def test_evaluate_counts_parse_failures_without_scoring_fields():
     record = GoldRecord(source="sroie", gold=_invoice(), image_path=Path("b.png"))
     predictor = _FakePredictor(
-        {"b.png": ExtractionResult(invoice=None, parse_error="malformed: not json")}
+        {
+            "b.png": ExtractionResult(
+                invoice=None,
+                parse_error="malformed: not json",
+                model_name="m",
+                raw_output=None,
+            )
+        }
     )
 
     run = await evaluate(predictor, [record])
@@ -88,7 +99,12 @@ async def test_evaluate_records_one_latency_sample_per_document():
         for i in range(3)
     ]
     predictor = _FakePredictor(
-        {f"{i}.png": ExtractionResult(invoice=gold, parse_error=None) for i in range(3)}
+        {
+            f"{i}.png": ExtractionResult(
+                invoice=gold, parse_error=None, model_name="m", raw_output=None
+            )
+            for i in range(3)
+        }
     )
 
     run = await evaluate(predictor, records)
@@ -137,8 +153,15 @@ async def test_print_report_includes_per_source_field_breakdown(capsys):
     ]
     predictor = _FakePredictor(
         {
-            "a.png": ExtractionResult(invoice=fatura_invoice, parse_error=None),
-            "b.png": ExtractionResult(invoice=sroie_invoice, parse_error=None),
+            "a.png": ExtractionResult(
+                invoice=fatura_invoice,
+                parse_error=None,
+                model_name="m",
+                raw_output=None,
+            ),
+            "b.png": ExtractionResult(
+                invoice=sroie_invoice, parse_error=None, model_name="m", raw_output=None
+            ),
         }
     )
 
@@ -162,8 +185,15 @@ async def test_print_report_adds_trained_fields_diagnostic_for_sroie_only(capsys
     ]
     predictor = _FakePredictor(
         {
-            "a.png": ExtractionResult(invoice=fatura_invoice, parse_error=None),
-            "b.png": ExtractionResult(invoice=sroie_invoice, parse_error=None),
+            "a.png": ExtractionResult(
+                invoice=fatura_invoice,
+                parse_error=None,
+                model_name="m",
+                raw_output=None,
+            ),
+            "b.png": ExtractionResult(
+                invoice=sroie_invoice, parse_error=None, model_name="m", raw_output=None
+            ),
         }
     )
 
