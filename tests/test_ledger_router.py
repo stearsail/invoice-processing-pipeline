@@ -1,19 +1,29 @@
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from invoice_pipeline.api.routers.ledger import _to_response, edit_job, retry_job
-from invoice_pipeline.db.models import Job, LedgerEntry
-from invoice_pipeline.db.operations import create_job, update_job, write_entry
+from invoice_pipeline.api.routers.ledger import (
+    _to_response,
+    delete_job_by_id,
+    edit_job,
+    get_full_ledger,
+    get_job_by_id,
+    get_reviewables,
+    retry_job,
+)
+from invoice_pipeline.db.models import Extraction, Job, LedgerEntry
+from invoice_pipeline.db.operations import create_job, update_job, write_extractions
 from invoice_pipeline.queue.jobs import arq_job_id
 from invoice_pipeline.schema import Invoice
+
+_INVOICE_DATA = {"document_type": "receipt", "currency": "USD", "grand_total": "10.00"}
 
 
 def _job(**overrides) -> Job:
@@ -21,6 +31,7 @@ def _job(**overrides) -> Job:
         id=1,
         status="complete",
         error=None,
+        attempts=1,
         file_key="a1b2c3d4.png",
         created_at=datetime(2026, 7, 15, 12, 0, 0),
     )
@@ -28,70 +39,127 @@ def _job(**overrides) -> Job:
     return Job(**defaults)
 
 
-def _entry(**overrides) -> LedgerEntry:
+def _extraction_row(**overrides) -> Extraction:
     defaults = dict(
-        id=1,
+        id=4,
+        job_id=1,
+        run=1,
+        extractor="specialist",
+        model="qwen-ft",
+        trigger="initial",
+        invoice_data=_INVOICE_DATA,
+        parse_error=None,
+        issues=[{"category": "mismatch", "message": "Line items sum to 9.00"}],
+        is_final=True,
+        created_at=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+    )
+    defaults.update(overrides)
+    return Extraction(**defaults)
+
+
+def _entry_row(**overrides) -> LedgerEntry:
+    defaults = dict(
+        id=9,
+        job_id=1,
+        source_extraction_id=4,
         invoice_number=None,
         vendor_name=None,
         issue_date=None,
         currency="USD",
         grand_total=Decimal("10.00"),
-        invoice_data={
-            "document_type": "receipt",
-            "currency": "USD",
-            "grand_total": "10.00",
-        },
-        created_at=datetime(2026, 7, 15, 12, 0, 0),
-        needs_review=False,
-        review_reason=None,
-        job_id=1,
+        invoice_data=_INVOICE_DATA,
+        corrected=False,
+        reviewed_at=datetime(2026, 7, 16, 9, 0, 0, tzinfo=UTC),
     )
     defaults.update(overrides)
     return LedgerEntry(**defaults)
 
 
-def test_to_response_with_no_entry():
-    job = _job(status="extraction_failed", error="extraction failed entirely")
+# --- _to_response ------------------------------------------------------------
 
-    response = _to_response(job, None)
+
+def test_to_response_for_a_job_with_nothing_attached():
+    job = _job(status="extraction_failed", error="invalid_output: not json")
+
+    response = _to_response(job, None, None)
 
     assert response.job_id == 1
     assert response.status == "extraction_failed"
-    assert response.error == "extraction failed entirely"
+    assert response.error == "invalid_output: not json"
+    assert response.extraction is None
+    assert response.extraction_error is None
     assert response.ledger_entry is None
     assert response.ledger_entry_error is None
 
 
-def test_to_response_with_valid_entry():
-    job = _job()
-    entry = _entry(
-        needs_review=True,
-        review_reason=[{"category": "unverifiable", "message": "Missing subtotal"}],
+def test_to_response_maps_the_extraction_the_reviewer_starts_from():
+    response = _to_response(_job(), _extraction_row(), None)
+
+    assert response.extraction.id == 4
+    assert response.extraction.extractor == "specialist"
+    assert response.extraction.model == "qwen-ft"
+    assert response.extraction.trigger == "initial"
+    assert response.extraction.invoice_data.grand_total == Decimal("10.00")
+    assert response.extraction.issues[0].category == "mismatch"
+    assert response.ledger_entry is None
+
+
+def test_to_response_maps_an_approved_entry():
+    response = _to_response(_job(), _extraction_row(), _entry_row(corrected=True))
+
+    assert response.ledger_entry.id == 9
+    assert response.ledger_entry.source_extraction_id == 4
+    assert response.ledger_entry.corrected is True
+    assert response.ledger_entry.reviewed_at == datetime(2026, 7, 16, 9, tzinfo=UTC)
+    assert response.ledger_entry.invoice_data.document_type == "receipt"
+
+
+def test_to_response_maps_an_entry_typed_in_for_a_total_failure():
+    entry = _entry_row(source_extraction_id=None, corrected=None)
+
+    response = _to_response(_job(status="extraction_failed"), None, entry)
+
+    assert response.extraction is None
+    assert response.ledger_entry.source_extraction_id is None
+    assert response.ledger_entry.corrected is None
+
+
+def test_to_response_isolates_a_corrupt_extraction_from_the_rest_of_the_row():
+    extraction = _extraction_row(invoice_data={"this": "matches nothing"})
+
+    response = _to_response(_job(), extraction, _entry_row())
+
+    # one stale row must not 500 the whole list, nor blank out its other parts
+    assert response.job_id == 1
+    assert response.extraction is None
+    assert "document_type" in response.extraction_error
+    assert response.ledger_entry.id == 9
+    assert response.ledger_entry_error is None
+
+
+def test_to_response_isolates_a_corrupt_ledger_entry_from_the_rest_of_the_row():
+    entry = _entry_row(invoice_data={"this": "matches nothing"})
+
+    response = _to_response(_job(), _extraction_row(), entry)
+
+    assert response.ledger_entry is None
+    assert "document_type" in response.ledger_entry_error
+    assert response.extraction.id == 4
+    assert response.extraction_error is None
+
+
+def test_to_response_accepts_a_failed_extraction_with_no_invoice():
+    extraction = _extraction_row(
+        invoice_data=None, parse_error="invalid_output: x", is_final=False, issues=[]
     )
 
-    response = _to_response(job, entry)
+    response = _to_response(_job(), extraction, None)
 
-    assert response.ledger_entry is not None
-    assert response.ledger_entry.needs_review is True
-    assert len(response.ledger_entry.review_reason) == 1
-    assert response.ledger_entry.review_reason[0].category == "unverifiable"
-    assert response.ledger_entry.review_reason[0].message == "Missing subtotal"
-    assert response.ledger_entry.invoice_data.document_type == "receipt"
-    assert response.ledger_entry_error is None
+    assert response.extraction.invoice_data is None
+    assert response.extraction.parse_error == "invalid_output: x"
 
 
-def test_to_response_degrades_gracefully_on_corrupt_invoice_data():
-    job = _job()
-    entry = _entry(invoice_data={"this": "does not match the Invoice schema at all"})
-
-    response = _to_response(job, entry)
-
-    # the whole row must still come back, not raise — job-level fields stay populated
-    assert response.job_id == 1
-    assert response.status == "complete"
-    assert response.ledger_entry is None
-    assert response.ledger_entry_error is not None
-    assert "document_type" in response.ledger_entry_error
+# --- endpoints against a real session ---------------------------------------
 
 
 @pytest.fixture
@@ -122,137 +190,111 @@ def _invoice(**overrides) -> Invoice:
     return Invoice(**defaults)
 
 
-async def _failed_job(session, attempts: int = 2, error: str = "boom") -> Job:
-    """A job whose extraction produced no invoice — so no ledger entry exists."""
-    job = await create_job(session, file_key="a1b2c3d4.png")
-    await update_job(
+async def _job_with_status(
+    session, status: str, attempts: int = 1, error: str | None = None
+) -> Job:
+    job = await create_job(session, file_key=f"{status}.png")
+    return await update_job(
         session,
         job_id=job.id,
-        status_update="extraction_failed",
+        status_update=status,
         attempts_update=attempts,
         error_update=error,
+    )
+
+
+async def _extracted_job(session, invoice: Invoice) -> Job:
+    # what the worker leaves behind: a complete job with one final extraction
+    job = await _job_with_status(session, "complete")
+    await write_extractions(
+        session,
+        job.id,
+        [
+            Extraction(
+                job_id=job.id,
+                extractor="specialist",
+                model="qwen-ft",
+                trigger="initial",
+                invoice_data=invoice.model_dump(mode="json"),
+                is_final=True,
+            )
+        ],
     )
     return job
 
 
-@pytest.mark.anyio
-async def test_edit_job_on_failed_job_writes_a_confirmed_entry(session):
-    job = await _failed_job(session)
-
-    response = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
-
-    assert response.status == "complete"
-    assert response.ledger_entry is not None
-    assert response.ledger_entry.needs_review is False
-    assert response.ledger_entry.review_reason is None
-    # written from scratch by a human — no model attempt to attribute this to
-    assert response.ledger_entry.extracted_by is None
-
-
-@pytest.mark.anyio
-async def test_edit_job_on_failed_job_preserves_the_worker_attempt_count(session):
-    # attempts is owned by the worker (arq's job_try); a human edit must not reset it
-    job = await _failed_job(session, attempts=3)
-
-    response = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
-
-    assert response.attempts == 3
-
-
-@pytest.mark.anyio
-async def test_edit_job_on_failed_job_clears_the_stale_error(session):
-    job = await _failed_job(session, error="Extraction failed entirely — timeout")
-
-    response = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
-
-    assert response.error is None
-
-
-@pytest.mark.anyio
-async def test_edit_job_on_flagged_entry_corrects_it_and_clears_review(session):
-    job = await create_job(session, file_key="b2c3d4e5.png")
-    await update_job(
-        session, job_id=job.id, status_update="complete", attempts_update=1
+async def _failed_job(session, attempts: int = 2, error: str = "boom") -> Job:
+    job = await _job_with_status(
+        session, "extraction_failed", attempts=attempts, error=error
     )
-    original = await write_entry(
+    await write_extractions(
         session,
         job.id,
-        _invoice(),
-        needs_review=True,
-        review_reason=[{"category": "mismatch", "message": "Line items sum to 9.00"}],
+        [
+            Extraction(
+                job_id=job.id,
+                extractor="specialist",
+                model="qwen-ft",
+                trigger="initial",
+                parse_error=error,
+            )
+        ],
     )
+    return job
 
-    corrected = _invoice(invoice_number="INV-42", grand_total=Decimal("99.99"))
-    response = await edit_job(job_id=job.id, invoice=corrected, session=session)
 
+async def _entry_count(session, job_id: int) -> int:
+    statement = (
+        select(func.count())
+        .select_from(LedgerEntry)
+        .where(LedgerEntry.job_id == job_id)
+    )
+    return (await session.exec(statement)).one()
+
+
+@pytest.mark.anyio
+async def test_approving_an_extracted_job_links_the_entry_to_its_extraction(session):
+    job = await _extracted_job(session, _invoice())
+
+    response = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    # the response carries the entry just saved, not the pre-approval state
     assert response.ledger_entry is not None
-    # updated in place rather than appending a second entry for the same job
-    assert response.ledger_entry.id == original.id
-    assert response.ledger_entry.needs_review is False
-    assert response.ledger_entry.review_reason is None
+    assert response.ledger_entry.source_extraction_id == response.extraction.id
+    assert response.ledger_entry.corrected is False
+    assert response.ledger_entry.reviewed_at is not None
+
+
+@pytest.mark.anyio
+async def test_approving_with_edits_marks_the_entry_corrected(session):
+    job = await _extracted_job(session, _invoice())
+
+    edited = _invoice(invoice_number="INV-42", grand_total=Decimal("99.99"))
+    response = await edit_job(job_id=job.id, invoice=edited, session=session)
+
+    assert response.ledger_entry.corrected is True
     assert response.ledger_entry.grand_total == Decimal("99.99")
-    assert response.ledger_entry.invoice_data.invoice_number == "INV-42"
-    assert response.ledger_entry.reviewed_with_changes is True
+    assert response.ledger_entry.invoice_number == "INV-42"
+    # the model's output is kept untouched next to the human truth
+    assert response.extraction.invoice_data.grand_total == Decimal("10.00")
 
 
 @pytest.mark.anyio
-async def test_edit_job_on_flagged_entry_with_no_changes_marks_reviewed_without_changes(
-    session,
-):
-    job = await create_job(session, file_key="c3d4e5f6.png")
-    await update_job(
-        session, job_id=job.id, status_update="complete", attempts_update=1
-    )
-    original_invoice = _invoice(invoice_number="INV-1")
-    await write_entry(
-        session,
-        job.id,
-        original_invoice,
-        needs_review=True,
-        review_reason=[{"category": "unverifiable", "message": "Missing subtotal"}],
+async def test_the_same_amount_written_differently_is_not_a_correction(session):
+    job = await _extracted_job(session, _invoice(grand_total=Decimal("100")))
+
+    response = await edit_job(
+        job_id=job.id, invoice=_invoice(grand_total=Decimal("100.00")), session=session
     )
 
-    # reviewer looks it over and confirms as-is, submitting the same data back
-    response = await edit_job(job_id=job.id, invoice=original_invoice, session=session)
-
-    assert response.ledger_entry.needs_review is False
-    assert response.ledger_entry.reviewed_with_changes is False
+    assert response.ledger_entry.corrected is False
 
 
 @pytest.mark.anyio
-async def test_edit_job_stores_a_reviewer_entered_negative_discount_as_positive(
-    session,
-):
-    # FastAPI builds the request body with Invoice.model_validate, so a
-    # reviewer typing "-5.00" goes through the same schema rule as the models
-    job = await _failed_job(session)
-    submitted = Invoice.model_validate(
-        {
-            "document_type": "receipt",
-            "currency": "USD",
-            "grand_total": "95.00",
-            "discount": "-5.00",
-        }
-    )
-
-    response = await edit_job(job_id=job.id, invoice=submitted, session=session)
-
-    assert response.ledger_entry.invoice_data.discount == Decimal("5.00")
-
-
-@pytest.mark.anyio
-async def test_edit_job_does_not_count_a_discount_sign_flip_as_a_change(session):
-    # "-5.00" and "5.00" are the same discount; confirming an entry while
-    # typing the sign differently is a confirmation, not a correction
-    job = await create_job(session, file_key="d4e5f6a7.png")
-    await update_job(
-        session, job_id=job.id, status_update="complete", attempts_update=1
-    )
-    await write_entry(
-        session,
-        job.id,
-        _invoice(grand_total=Decimal("95.00"), discount=Decimal("5.00")),
-        needs_review=True,
+async def test_a_discount_sign_flip_is_not_a_correction(session):
+    # "-5.00" and "5.00" are the same discount once the schema normalizes it
+    job = await _extracted_job(
+        session, _invoice(grand_total=Decimal("95.00"), discount=Decimal("5.00"))
     )
     resubmitted = Invoice.model_validate(
         {
@@ -265,11 +307,68 @@ async def test_edit_job_does_not_count_a_discount_sign_flip_as_a_change(session)
 
     response = await edit_job(job_id=job.id, invoice=resubmitted, session=session)
 
-    assert response.ledger_entry.reviewed_with_changes is False
+    assert response.ledger_entry.corrected is False
+    assert response.ledger_entry.invoice_data.discount == Decimal("5.00")
 
 
 @pytest.mark.anyio
-async def test_edit_job_raises_404_for_unknown_job(session):
+async def test_reapproving_updates_the_entry_in_place_and_compares_to_the_model(
+    session,
+):
+    job = await _extracted_job(session, _invoice())
+    first = await edit_job(
+        job_id=job.id, invoice=_invoice(invoice_number="INV-1"), session=session
+    )
+
+    # back to what the model said: corrected is model-vs-human, not edit-vs-edit
+    second = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    assert second.ledger_entry.id == first.ledger_entry.id
+    assert first.ledger_entry.corrected is True
+    assert second.ledger_entry.corrected is False
+    assert second.ledger_entry.reviewed_at >= first.ledger_entry.reviewed_at
+    assert await _entry_count(session, job.id) == 1
+
+
+@pytest.mark.anyio
+async def test_approving_a_total_failure_has_no_model_output_to_compare(session):
+    job = await _failed_job(session)
+
+    response = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    assert response.extraction is None
+    assert response.ledger_entry.source_extraction_id is None
+    assert response.ledger_entry.corrected is None
+
+
+@pytest.mark.anyio
+async def test_approving_leaves_the_pipelines_record_of_the_job_alone(session):
+    # status, error and attempts describe what the pipeline did; approval is the entry
+    job = await _failed_job(session, attempts=3, error="invalid_output: not json")
+
+    response = await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    assert response.status == "extraction_failed"
+    assert response.error == "invalid_output: not json"
+    assert response.attempts == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", ["pending", "retrying", "error"])
+async def test_approving_an_unfinished_job_is_rejected(session, status):
+    # an approval saved before the extraction lands could never link to it
+    job = await _job_with_status(session, status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    assert exc_info.value.status_code == 409
+    assert status in exc_info.value.detail
+    assert await _entry_count(session, job.id) == 0
+
+
+@pytest.mark.anyio
+async def test_approving_an_unknown_job_is_a_404(session):
     with pytest.raises(HTTPException) as exc_info:
         await edit_job(job_id=999, invoice=_invoice(), session=session)
 
@@ -277,15 +376,80 @@ async def test_edit_job_raises_404_for_unknown_job(session):
     assert "999" in exc_info.value.detail
 
 
+@pytest.mark.anyio
+async def test_approval_moves_a_job_from_the_review_queue_to_the_ledger(session):
+    job = await _extracted_job(session, _invoice())
+    assert [r.job_id for r in await get_reviewables(session=session)] == [job.id]
+    assert await get_full_ledger(session=session) == []
+
+    await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    assert await get_reviewables(session=session) == []
+    [resolved] = await get_full_ledger(session=session)
+    assert resolved.job_id == job.id
+    assert resolved.ledger_entry is not None
+    assert resolved.extraction is not None
+
+
+@pytest.mark.anyio
+async def test_review_queue_shows_total_failures_with_no_extraction(session):
+    job = await _failed_job(session)
+
+    [item] = await get_reviewables(session=session)
+
+    assert item.job_id == job.id
+    assert item.extraction is None
+    assert item.ledger_entry is None
+
+
+@pytest.mark.anyio
+async def test_get_job_by_id_returns_the_job_with_everything_attached(session):
+    job = await _extracted_job(session, _invoice())
+    await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    response = await get_job_by_id(job_id=job.id, session=session)
+
+    assert response.job_id == job.id
+    assert response.extraction is not None
+    assert response.ledger_entry is not None
+
+
+@pytest.mark.anyio
+async def test_get_job_by_id_is_a_404_for_an_unknown_job(session):
+    with pytest.raises(HTTPException) as exc_info:
+        await get_job_by_id(job_id=999, session=session)
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_delete_removes_an_approved_job_and_echoes_what_was_deleted(session):
+    job = await _extracted_job(session, _invoice())
+    await edit_job(job_id=job.id, invoice=_invoice(), session=session)
+
+    response = await delete_job_by_id(job_id=job.id, session=session)
+
+    assert response.job_id == job.id
+    assert response.ledger_entry is not None
+    assert response.extraction is not None
+    with pytest.raises(HTTPException) as exc_info:
+        await get_job_by_id(job_id=job.id, session=session)
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_delete_is_a_404_for_an_unknown_job(session):
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_job_by_id(job_id=999, session=session)
+
+    assert exc_info.value.status_code == 404
+
+
+# --- retry -------------------------------------------------------------------
+
+
 async def _errored_job(session) -> Job:
-    job = await create_job(session, file_key="e5f6a7b8.png")
-    return await update_job(
-        session,
-        job_id=job.id,
-        status_update="error",
-        attempts_update=3,
-        error_update="TimeoutError",
-    )
+    return await _job_with_status(session, "error", attempts=3, error="TimeoutError")
 
 
 @pytest.mark.anyio
@@ -315,3 +479,15 @@ async def test_retry_job_of_a_job_arq_still_has_logs_and_returns_pending(
 
     assert response.status == "pending"
     assert arq_job_id(job.id) in caplog.text
+
+
+@pytest.mark.anyio
+async def test_retry_job_refuses_a_job_that_is_not_in_error(session):
+    job = await _job_with_status(session, "complete")
+    pool = AsyncMock()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await retry_job(job_id=job.id, session=session, pool=pool)
+
+    assert exc_info.value.status_code == 409
+    pool.enqueue_job.assert_not_awaited()

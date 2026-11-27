@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from invoice_pipeline.workflow import runner
-from invoice_pipeline.util.reconciliation import ReconciliationIssue
+from invoice_pipeline.workflow.state import ExtractionRecord
 
 
 @pytest.fixture
@@ -17,57 +17,55 @@ def _fake_graph(final_state: dict) -> MagicMock:
     return graph
 
 
+def _record(invoice=None, parse_error=None) -> ExtractionRecord:
+    return ExtractionRecord(
+        extractor="specialist",
+        model="m",
+        trigger="initial",
+        invoice=invoice,
+        parse_error=parse_error,
+        raw_output=None,
+    )
+
+
 @pytest.mark.anyio
-async def test_run_extraction_reports_complete_with_ledger_entry_id(monkeypatch):
-    graph = _fake_graph({"invoice": MagicMock(), "ledger_entry_id": 7})
+async def test_run_extraction_reports_complete_when_an_invoice_is_selected(
+    monkeypatch,
+):
+    graph = _fake_graph({"extractions": [_record(invoice=MagicMock())], "selected": 0})
     monkeypatch.setattr(runner, "graph", graph)
 
     result = await runner.run_extraction(job_id=1, img_path="fake.png")
 
     assert result.status == "complete"
-    assert result.ledger_entry_id == 7
     assert result.error is None
 
 
 @pytest.mark.anyio
-async def test_run_extraction_seeds_state_from_job_and_path(monkeypatch):
-    graph = _fake_graph({"invoice": MagicMock(), "ledger_entry_id": 1})
+async def test_run_extraction_seeds_every_key_the_nodes_read(monkeypatch):
+    # LangGraph state only holds keys someone wrote: an unseeded key is a KeyError mid-graph
+    graph = _fake_graph({"extractions": [_record(invoice=MagicMock())], "selected": 0})
     monkeypatch.setattr(runner, "graph", graph)
 
     await runner.run_extraction(job_id=42, img_path="uploads/a1b2.png")
 
-    seeded = graph.ainvoke.await_args.kwargs["input"]
-    assert seeded["job_id"] == 42
-    assert seeded["image"] == "uploads/a1b2.png"
-    assert seeded["invoice"] is None
+    assert graph.ainvoke.await_args.kwargs["input"] == {
+        "job_id": 42,
+        "image": "uploads/a1b2.png",
+        "extractions": [],
+        "selected": None,
+    }
 
 
 @pytest.mark.anyio
-async def test_run_extraction_seeds_provenance_and_retry_budget(monkeypatch):
-    # route_after_reconcile reads frontier_attempted on any draft with issues,
-    # and LangGraph state only holds keys someone wrote — an unseeded key is a
-    # KeyError mid-graph, not a default
-    graph = _fake_graph({"invoice": MagicMock(), "ledger_entry_id": 1})
-    monkeypatch.setattr(runner, "graph", graph)
-
-    await runner.run_extraction(job_id=1, img_path="fake.png")
-
-    seeded = graph.ainvoke.await_args.kwargs["input"]
-    assert seeded["extracted_by"] is None
-    assert seeded["frontier_attempted"] is False
-
-
-@pytest.mark.anyio
-async def test_run_extraction_reports_failure_with_joined_issue_messages(monkeypatch):
+async def test_run_extraction_reports_failure_with_joined_parse_errors(monkeypatch):
     graph = _fake_graph(
         {
-            "invoice": None,
-            "reconciliation_issues": [
-                ReconciliationIssue(
-                    category="unverifiable", message="Missing subtotal"
-                ),
-                ReconciliationIssue(category="unverifiable", message="No line items"),
+            "extractions": [
+                _record(parse_error="invalid_output: not json"),
+                _record(parse_error="rejected_input: 400"),
             ],
+            "selected": None,
         }
     )
     monkeypatch.setattr(runner, "graph", graph)
@@ -75,17 +73,4 @@ async def test_run_extraction_reports_failure_with_joined_issue_messages(monkeyp
     result = await runner.run_extraction(job_id=1, img_path="fake.png")
 
     assert result.status == "extraction_failed"
-    assert result.ledger_entry_id is None
-    assert result.error == "Missing subtotal; No line items"
-
-
-@pytest.mark.anyio
-async def test_run_extraction_handles_missing_ledger_entry_id(monkeypatch):
-    """An invoice that reached the ledger but produced no id must not raise."""
-    graph = _fake_graph({"invoice": MagicMock()})
-    monkeypatch.setattr(runner, "graph", graph)
-
-    result = await runner.run_extraction(job_id=1, img_path="fake.png")
-
-    assert result.status == "complete"
-    assert result.ledger_entry_id is None
+    assert result.error == "invalid_output: not json; rejected_input: 400"

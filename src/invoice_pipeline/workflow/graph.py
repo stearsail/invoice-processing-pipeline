@@ -4,13 +4,13 @@ from langgraph.graph import END, START, StateGraph
 from invoice_pipeline.workflow.nodes import (
     frontier_extract,
     frontier_review_fallback,
-    ledger_write,
+    persist_extractions,
     route_after_parsing,
     route_after_reconcile,
     specialist_extract,
     validate_reconcile,
 )
-from invoice_pipeline.workflow.state import Context, State
+from invoice_pipeline.workflow.state import State
 from invoice_pipeline.config import (
     FRONTIER_MODEL,
     SPECIALIST_MODEL,
@@ -22,7 +22,7 @@ from invoice_pipeline.config import (
 
 
 def build_graph(specialist: SpecialistExtractor, frontier: FrontierExtractor):
-    builder = StateGraph(state_schema=State, context_schema=Context)
+    builder = StateGraph(state_schema=State)
     # partial is used because add_node stores the function and calls later as node(state), so object hadnded must be a CALLABLE that takes one argument
     # partial supplies one argument now (at node construction) and the rest later (the specialist arg for extraction) — hence partial aplication
     builder.add_node("specialist_extract", partial(specialist_extract, specialist))
@@ -31,7 +31,7 @@ def build_graph(specialist: SpecialistExtractor, frontier: FrontierExtractor):
     builder.add_node(
         "frontier_review_fallback", partial(frontier_review_fallback, frontier)
     )
-    builder.add_node("ledger_write", ledger_write)
+    builder.add_node("persist_extractions", persist_extractions)
 
     builder.add_edge(START, "specialist_extract")
     builder.add_conditional_edges(
@@ -48,12 +48,12 @@ def build_graph(specialist: SpecialistExtractor, frontier: FrontierExtractor):
         route_after_reconcile,
         {
             "retry_via_frontier": "frontier_review_fallback",
-            "reconciled": "ledger_write",
-            "total_failure": END,
+            "reconciled": "persist_extractions",
+            "total_failure": "persist_extractions",
         },
     )
     builder.add_edge("frontier_review_fallback", "validate_reconcile")
-    builder.add_edge("ledger_write", END)
+    builder.add_edge("persist_extractions", END)
     return builder.compile()
 
 

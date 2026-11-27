@@ -11,7 +11,7 @@ from invoice_pipeline.workflow.runner import run_extraction
 from invoice_pipeline.db.engine import session_factory
 from invoice_pipeline.db.operations import (
     mark_job_orphaned,
-    query_job_entry,
+    query_extractions,
     query_pending_jobs,
     update_job,
 )
@@ -57,13 +57,24 @@ async def _run_extraction_job(job_id: int, file_key: str) -> None:
 async def process_job(ctx, job_id, file_key):
     try:
         async with session_factory() as session:
-            job, entry = await query_job_entry(session, job_id)
-        if entry is not None:
-            logger.info(
-                "Job %s already has a ledger entry, skipping extraction", job.id
+            extractions = await query_extractions(session, job_id)
+        if extractions:
+            logger.info("Job %s already has extractions, skipping", job_id)
+            status = (
+                "complete"
+                if any(e.is_final for e in extractions)
+                else "extraction_failed"
+            )
+            error = (
+                "; ".join(e.parse_error for e in extractions)
+                if status == "extraction_failed"
+                else None
             )
             await _set_status(
-                job_id, status="complete", attempts=ctx["job_try"], error=None
+                job_id,
+                status=status,
+                attempts=ctx["job_try"],
+                error=error,
             )
             return
         async with asyncio.timeout(EXTRACTION_DEADLINE_S):

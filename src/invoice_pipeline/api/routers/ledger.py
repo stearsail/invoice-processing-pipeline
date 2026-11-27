@@ -4,14 +4,15 @@ import logging
 from pydantic import ValidationError
 from sqlmodel.ext.asyncio.session import AsyncSession
 from invoice_pipeline.api.schema.responses import (
-    ErroredJobResponse,
+    ExtractionResponse,
+    JobResponse,
     LedgerEntryResponse,
-    JobEntryPairResponse,
-    PendingJobResponse,
+    JobDetailResponse,
 )
 from invoice_pipeline.db.engine import get_async_session
-from invoice_pipeline.db.models import Job, LedgerEntry
+from invoice_pipeline.db.models import Extraction, Job, LedgerEntry
 from invoice_pipeline.db.operations import (
+    approve_job,
     delete_job_entry,
     query_errored_jobs,
     query_job,
@@ -19,9 +20,7 @@ from invoice_pipeline.db.operations import (
     query_pending_jobs,
     query_resolved_ledger,
     query_reviewables,
-    update_entry,
     update_job,
-    write_entry,
 )
 from invoice_pipeline.queue.jobs import arq_job_id
 from invoice_pipeline.queue.pool import get_redis_pool
@@ -32,7 +31,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ledger", tags=["ledger"])
 
 
-def _to_response(job: Job, entry: LedgerEntry | None) -> JobEntryPairResponse:
+def _to_response(
+    job: Job, extraction: Extraction | None, entry: LedgerEntry | None
+) -> JobDetailResponse:
+    # each part decodes on its own: a stale stored invoice fails one field, not the whole list
+    extraction_response = None
+    extraction_error = None
+    if extraction is not None:
+        try:
+            extraction_response = ExtractionResponse.model_validate(extraction)
+        except ValidationError as e:
+            logger.error(
+                "Failed to decode extraction %s for job %s: %s",
+                extraction.id,
+                job.id,
+                e,
+            )
+            extraction_error = str(e)
     ledger_entry = None
     ledger_entry_error = None
     if entry is not None:
@@ -46,19 +61,21 @@ def _to_response(job: Job, entry: LedgerEntry | None) -> JobEntryPairResponse:
                 e,
             )
             ledger_entry_error = str(e)
-    return JobEntryPairResponse(
+    return JobDetailResponse(
         job_id=job.id,
         created_at=job.created_at,
         status=job.status,
         error=job.error,
         attempts=job.attempts,
+        extraction=extraction_response,
+        extraction_error=extraction_error,
         ledger_entry=ledger_entry,
         ledger_entry_error=ledger_entry_error,
     )
 
 
-def _to_pending_response(job: Job) -> PendingJobResponse:
-    return PendingJobResponse(
+def _to_job_response(job: Job) -> JobResponse:
+    return JobResponse(
         job_id=job.id,
         created_at=job.created_at,
         status=job.status,
@@ -67,119 +84,99 @@ def _to_pending_response(job: Job) -> PendingJobResponse:
     )
 
 
-def _to_errored_response(job: Job) -> ErroredJobResponse:
-    return ErroredJobResponse(
-        job_id=job.id,
-        created_at=job.created_at,
-        status=job.status,
-        error=job.error,
-        attempts=job.attempts,
-    )
-
-
-@router.get("/review", response_model=list[JobEntryPairResponse])
+@router.get("/review", response_model=list[JobDetailResponse])
 async def get_reviewables(
     session: AsyncSession = Depends(get_async_session),
-) -> list[JobEntryPairResponse]:
+) -> list[JobDetailResponse]:
     results = await query_reviewables(session)
     reviewables = []
-    for job, entry in results:
-        reviewables.append((_to_response(job, entry)))
+    for job, extraction in results:
+        reviewables.append((_to_response(job, extraction, None)))
     return reviewables
 
 
-@router.get("/resolved", response_model=list[JobEntryPairResponse])
+@router.get("/resolved", response_model=list[JobDetailResponse])
 async def get_full_ledger(session: AsyncSession = Depends(get_async_session)):
     results = await query_resolved_ledger(session)
     entries = []
-    for job, entry in results:
-        entries.append((_to_response(job, entry)))
+    for job, extraction, entry in results:
+        entries.append((_to_response(job, extraction, entry)))
     return entries
 
 
-@router.get("/pending", response_model=list[PendingJobResponse])
+@router.get("/pending", response_model=list[JobResponse])
 async def get_pending_jobs(
     session: AsyncSession = Depends(get_async_session),
-) -> list[PendingJobResponse]:
+) -> list[JobResponse]:
     results = await query_pending_jobs(session)
     pending = []
     for job in results:
-        pending.append(_to_pending_response(job))
+        pending.append(_to_job_response(job))
     return pending
 
 
 @router.get("/errored")
 async def get_errored_jobs(
     session: AsyncSession = Depends(get_async_session),
-) -> list[ErroredJobResponse]:
+) -> list[JobResponse]:
     results = await query_errored_jobs(session)
     responses = []
     for job in results:
-        errored_job = _to_errored_response(job)
+        errored_job = _to_job_response(job)
         responses.append(errored_job)
     return responses
 
 
-@router.get("/{job_id}", response_model=JobEntryPairResponse)
+@router.get("/{job_id}", response_model=JobDetailResponse)
 async def get_job_by_id(
     job_id: int,
     session: AsyncSession = Depends(get_async_session),
-) -> JobEntryPairResponse:
+) -> JobDetailResponse:
     result = await query_job_entry(session, job_id)
     if result is None:
         raise HTTPException(
             status_code=404,
             detail=f"Job {job_id} not found",
         )
-    job, entry = result
-    return _to_response(job, entry)
+    job, extraction, entry = result
+    return _to_response(job, extraction, entry)
 
 
-@router.delete("/{job_id}", response_model=JobEntryPairResponse)
+@router.delete("/{job_id}", response_model=JobDetailResponse)
 async def delete_job_by_id(
     job_id: int,
     session: AsyncSession = Depends(get_async_session),
-) -> JobEntryPairResponse:
+) -> JobDetailResponse:
     result = await delete_job_entry(session, job_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    job, entry = result
-    return _to_response(job, entry)
+    job, extraction, entry = result
+    return _to_response(job, extraction, entry)
 
 
-@router.put("/{job_id}/edit", response_model=JobEntryPairResponse)
+@router.put("/{job_id}/edit", response_model=JobDetailResponse)
 async def edit_job(
     job_id: int, invoice: Invoice, session: AsyncSession = Depends(get_async_session)
-) -> JobEntryPairResponse:
+) -> JobDetailResponse:
     result = await query_job_entry(session, job_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    job, entry = result
-    if entry is None:
-        entry = await write_entry(
-            session=session,
-            job_id=job_id,
-            invoice=invoice,
-            needs_review=False,
-            review_reason=None,
+    job, extraction, _ = result
+    if job.status not in ("complete", "extraction_failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} is {job.status}; only finished jobs can be approved",
         )
-        job = await update_job(
-            session=session,
-            job_id=job_id,
-            status_update="complete",
-            attempts_update=job.attempts,
-        )
-    else:
-        entry = await update_entry(session=session, job_id=job_id, invoice=invoice)
-    return _to_response(job, entry)
+    approved_entry = await approve_job(session=session, job_id=job_id, invoice=invoice)
+    return _to_response(job, extraction, approved_entry)
 
 
-@router.post("/{job_id}/retry", response_model=ErroredJobResponse)
+@router.post("/{job_id}/retry", response_model=JobResponse)
 async def retry_job(
     job_id: int,
     session: AsyncSession = Depends(get_async_session),
     pool: ArqRedis = Depends(get_redis_pool),
-) -> ErroredJobResponse:
+) -> JobResponse:
     job = await query_job(session, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
@@ -205,4 +202,4 @@ async def retry_job(
             job.id,
             arq_job_id(job.id),
         )
-    return _to_errored_response(job)
+    return _to_job_response(job)

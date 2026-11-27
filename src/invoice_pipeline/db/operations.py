@@ -1,8 +1,8 @@
-from typing import Literal
+from datetime import UTC, datetime
 
 from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlmodel import or_, select, update
-from invoice_pipeline.db.models import Job, LedgerEntry
+from sqlmodel import and_, delete, func, select, update
+from invoice_pipeline.db.models import Extraction, Job, LedgerEntry
 from invoice_pipeline.schema import Invoice
 
 PENDING_STATUSES = ("pending", "retrying")
@@ -37,47 +37,59 @@ async def query_job(session: AsyncSession, job_id: int) -> Job:
     return job
 
 
-async def write_entry(
-    session: AsyncSession,
-    job_id: int,
-    invoice: Invoice,
-    needs_review: bool = False,
-    review_reason: list[dict] | None = None,
-    extracted_by: Literal["specialist", "frontier"] | None = None,
-) -> LedgerEntry:
-    entry = LedgerEntry(
-        invoice_number=invoice.invoice_number,
-        vendor_name=invoice.vendor.name if invoice.vendor else None,
-        issue_date=invoice.issue_date,
-        currency=invoice.currency,
-        grand_total=invoice.grand_total,
-        invoice_data=invoice.model_dump(mode="json"),
-        needs_review=needs_review,
-        review_reason=review_reason,
-        job_id=job_id,
-        extracted_by=extracted_by,
+async def query_extractions(session: AsyncSession, job_id: int) -> list[Extraction]:
+    statement = select(Extraction).where(Extraction.job_id == job_id)
+    results = await session.exec(statement)
+    rows = results.all()
+    return list(rows)
+
+
+async def write_extractions(
+    session: AsyncSession, job_id: int, extractions: list[Extraction]
+) -> None:
+    # clear the old final before inserting, or autoflush trips the one-final-per-job index
+    statement = (
+        update(Extraction)
+        .where(Extraction.job_id == job_id, Extraction.is_final)
+        .values(is_final=False)
     )
-    session.add(entry)
+    await session.exec(statement)
+    last_run = (
+        await session.exec(
+            select(func.max(Extraction.run)).where(Extraction.job_id == job_id)
+        )
+    ).one()
+    for extraction in extractions:
+        extraction.run = (last_run or 0) + 1
+    session.add_all(extractions)
     await session.commit()
-    return entry
 
 
-async def update_entry(
+async def approve_job(
     session: AsyncSession, job_id: int, invoice: Invoice
 ) -> LedgerEntry:
-    statement = select(LedgerEntry).where(LedgerEntry.job_id == job_id)
-    result = await session.exec(statement)
-    entry = result.first()
-    new_data = invoice.model_dump(mode="json")
-    entry.reviewed_with_changes = new_data != entry.invoice_data
+    final = (
+        await session.exec(
+            select(Extraction).where(Extraction.job_id == job_id, Extraction.is_final)
+        )
+    ).first()
+    entry = (
+        await session.exec(select(LedgerEntry).where(LedgerEntry.job_id == job_id))
+    ).first()
+    if entry is None:
+        entry = LedgerEntry(job_id=job_id)
+    entry.invoice_data = invoice.model_dump(mode="json")
     entry.invoice_number = invoice.invoice_number
     entry.vendor_name = invoice.vendor.name if invoice.vendor else None
     entry.issue_date = invoice.issue_date
     entry.currency = invoice.currency
     entry.grand_total = invoice.grand_total
-    entry.invoice_data = new_data
-    entry.needs_review = False
-    entry.review_reason = None
+    entry.source_extraction_id = final.id if final else None
+    # compare parsed models, not JSON: "100" vs "100.00" is the same amount
+    entry.corrected = (
+        invoice != Invoice.model_validate(final.invoice_data) if final else None
+    )
+    entry.reviewed_at = datetime.now(UTC)
     session.add(entry)
     await session.commit()
     return entry
@@ -85,9 +97,15 @@ async def update_entry(
 
 async def query_job_entry(
     session: AsyncSession, job_id: int
-) -> tuple[Job, LedgerEntry | None] | None:
+) -> tuple[Job, Extraction | None, LedgerEntry | None] | None:
     statement = (
-        select(Job, LedgerEntry)
+        select(Job, Extraction, LedgerEntry)
+        # is_final belongs in ON: in WHERE it would drop jobs with no final extraction
+        .join(
+            Extraction,
+            onclause=and_(Extraction.job_id == Job.id, Extraction.is_final),
+            isouter=True,
+        )
         .join(LedgerEntry, onclause=LedgerEntry.job_id == Job.id, isouter=True)
         .where(Job.id == job_id)
     )
@@ -95,60 +113,61 @@ async def query_job_entry(
     row = results.first()
     if row is None:
         return None
-    return (row[0], row[1])
-
-
-async def delete_job_entry(
-    session: AsyncSession, job_id: int
-) -> tuple[Job, LedgerEntry | None] | None:
-    statement = (
-        select(Job, LedgerEntry)
-        .join(LedgerEntry, onclause=LedgerEntry.job_id == Job.id, isouter=True)
-        .where(Job.id == job_id)
-    )
-    result = await session.exec(statement)
-    row = result.first()
-    if row is None:
-        return None
-    job, entry = row
-    if entry is not None:
-        await session.delete(entry)
-        await session.flush()
-    await session.delete(job)
-    await session.commit()
-    return (job, entry)
+    job, extraction, entry = row
+    return (job, extraction, entry)
 
 
 async def query_reviewables(
     session: AsyncSession,
-) -> list[tuple[Job, LedgerEntry | None]]:
+) -> list[tuple[Job, Extraction | None]]:
     statement = (
-        select(Job, LedgerEntry)
+        select(Job, Extraction)
+        .join(
+            Extraction,
+            onclause=and_(Extraction.job_id == Job.id, Extraction.is_final),
+            isouter=True,
+        )
         .join(LedgerEntry, onclause=LedgerEntry.job_id == Job.id, isouter=True)
-        .where(or_(Job.status == "extraction_failed", LedgerEntry.needs_review))
+        .where(
+            Job.status.in_(("complete", "extraction_failed")),
+            # anti-join: keep only jobs the outer join found no ledger entry for
+            LedgerEntry.id.is_(None),
+        )
+        .order_by(Job.id)
     )
-
     results = await session.exec(statement)
-    reviewables = []
-    for row in results:
-        reviewables.append((row[0], row[1]))
-    return reviewables
+    return [(job, extraction) for job, extraction in results]
+
+
+async def delete_job_entry(
+    session: AsyncSession, job_id: int
+) -> tuple[Job, Extraction | None, LedgerEntry | None] | None:
+    found = await query_job_entry(session, job_id)
+    if found is None:
+        return None
+    # FK order: ledgerentry.source_extraction_id references extraction
+    await session.exec(delete(LedgerEntry).where(LedgerEntry.job_id == job_id))
+    await session.exec(delete(Extraction).where(Extraction.job_id == job_id))
+    await session.exec(delete(Job).where(Job.id == job_id))
+    await session.commit()
+    return found
 
 
 async def query_resolved_ledger(
     session: AsyncSession,
-) -> list[tuple[Job, LedgerEntry | None]]:
+) -> list[tuple[Job, Extraction | None, LedgerEntry]]:
     statement = (
-        select(Job, LedgerEntry)
-        .join(LedgerEntry, onclause=LedgerEntry.job_id == Job.id, isouter=False)
-        .where(Job.status == "complete", LedgerEntry.needs_review == False)  # noqa: E712
-        # RUFF SUGGESTS "not LedgerEntry.needs_review — this won't work since truthiness of a column object is always truthy"
+        select(Job, Extraction, LedgerEntry)
+        .join(LedgerEntry, onclause=LedgerEntry.job_id == Job.id)
+        .join(
+            Extraction,
+            onclause=and_(Extraction.job_id == Job.id, Extraction.is_final),
+            isouter=True,
+        )
+        .order_by(Job.id)
     )
     results = await session.exec(statement)
-    entries = []
-    for row in results:
-        entries.append((row[0], row[1]))
-    return entries
+    return [(job, extraction, entry) for job, extraction, entry in results]
 
 
 async def query_pending_jobs(session: AsyncSession) -> list[Job]:
@@ -184,6 +203,35 @@ async def find_duplicate(
     statement = select(LedgerEntry).where(
         LedgerEntry.invoice_number == invoice_number,
         LedgerEntry.vendor_name == vendor_name,
+    )
+    result = await session.exec(statement)
+    return result.first()
+
+
+async def find_pending_duplicate(
+    session: AsyncSession,
+    invoice_number: str | None,
+    vendor_name: str | None,
+    exclude_job_id: int,
+) -> int | None:
+    if invoice_number is None or vendor_name is None:
+        return None
+
+    statement = (
+        select(Extraction.job_id)
+        .join(
+            LedgerEntry, onclause=LedgerEntry.job_id == Extraction.job_id, isouter=True
+        )
+        .where(
+            Extraction.is_final,
+            # approved jobs are covered by find_duplicate, with the reviewer's corrected values
+            LedgerEntry.id.is_(None),
+            # a re-run must not match its own earlier extraction
+            Extraction.job_id != exclude_job_id,
+            Extraction.invoice_data["invoice_number"].as_string() == invoice_number,
+            Extraction.invoice_data[("vendor", "name")].as_string() == vendor_name,
+        )
+        .order_by(Extraction.job_id)
     )
     result = await session.exec(statement)
     return result.first()

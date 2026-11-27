@@ -41,18 +41,16 @@ class UploadResponse(BaseModel):
 
 class LedgerEntryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    id: int | None
+    id: int
     invoice_number: str | None
     vendor_name: str | None
     issue_date: date | None
     currency: str
     grand_total: Decimal
     invoice_data: Invoice
-    created_at: datetime
-    needs_review: bool
-    review_reason: list[ReconciliationIssue] | None
-    extracted_by: Literal["specialist", "frontier"] | None
-    reviewed_with_changes: bool | None
+    source_extraction_id: int | None
+    corrected: bool | None
+    reviewed_at: datetime
 
 
 class JobResponse(BaseModel):
@@ -63,14 +61,20 @@ class JobResponse(BaseModel):
     attempts: int
 
 
-class JobEntryPairResponse(JobResponse):
+class ExtractionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    extractor: Literal["specialist", "frontier"]
+    model: str
+    trigger: Literal["initial", "parse_fallback", "reconcile_retry"]
+    invoice_data: Invoice | None
+    parse_error: str | None
+    issues: list[ReconciliationIssue]
+    created_at: datetime
+
+
+class JobDetailResponse(JobResponse):
     ledger_entry: LedgerEntryResponse | None
     ledger_entry_error: str | None = None
-
-
-class PendingJobResponse(JobResponse):
-    pass
-
-
-class ErroredJobResponse(JobResponse):
-    pass
+    extraction: ExtractionResponse | None
+    extraction_error: str | None = None
