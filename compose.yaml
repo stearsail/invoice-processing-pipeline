@@ -43,7 +43,7 @@ services:
     env_file:
       - .env
     healthcheck:
-      test: ["CMD", "arq --check invoice_pipeline.queue.worker.WorkerSettings"]
+      test: ["CMD", "arq", "--check", "invoice_pipeline.queue.worker.WorkerSettings"]
       interval: 5s
       timeout: 3s
       retries: 3
