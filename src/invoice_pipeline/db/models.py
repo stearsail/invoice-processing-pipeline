@@ -1,32 +1,67 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
-from sqlmodel import JSON, SQLModel, Field, Column, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlmodel import (
+    JSON,
+    DateTime,
+    Index,
+    SQLModel,
+    Field,
+    String,
+    UniqueConstraint,
+    text,
+)
+
+JsonB = JSON().with_variant(JSONB(), "postgresql")
 
 
 class LedgerEntry(SQLModel, table=True):
-    __table_args__ = (UniqueConstraint("job_id", name="uq_ledgerentry_job_id"),)
+    __table_args__ = (
+        UniqueConstraint("job_id", name="uq_ledgerentry_job_id"),
+        Index("ix_ledgerentry_vendor_invoice", "vendor_name", "invoice_number"),
+    )
 
     id: int | None = Field(default=None, primary_key=True)
-    invoice_number: str | None = Field(default=None, index=True)
-    vendor_name: str | None = Field(default=None, index=True)
-    issue_date: date | None = None
+    job_id: int = Field(foreign_key="job.id", ondelete="CASCADE")
+    source_extraction_id: int | None = Field(default=None, foreign_key="extraction.id")
+    invoice_data: dict = Field(sa_type=JsonB)
+    invoice_number: str | None = Field(default=None)
+    vendor_name: str | None = Field(default=None)
+    issue_date: date | None = Field(default=None)
     currency: str
     grand_total: Decimal
-    invoice_data: dict = Field(sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=datetime.now)
-    needs_review: bool = Field(default=False, index=True)
-    review_reason: list[dict] | None = Field(sa_column=Column(JSON))
-    job_id: int = Field(foreign_key="job.id")
-    # which extractor's output this entry was written from. null for entries
-    # written by a human from scratch (edit_job on a job with no prior entry)
-    extracted_by: Literal["specialist", "frontier"] | None = Field(
-        default=None, sa_column=Column(String, nullable=True)
+    corrected: bool | None = Field(default=None)
+    reviewed_at: datetime = Field(sa_type=DateTime(timezone=True))
+
+
+class Extraction(SQLModel, table=True):
+    __table_args__ = (
+        Index(
+            "uq_extraction_one_final_per_job",
+            "job_id",
+            unique=True,
+            postgresql_where=text("is_final"),
+            sqlite_where=text("is_final"),
+        ),
     )
-    # true if the reviewer's submission actually differs from what was stored
-    # false if they confirmed it as-is
-    # null until reviewed at all
-    reviewed_with_changes: bool | None = Field(default=None)
+
+    id: int | None = Field(default=None, primary_key=True)
+    job_id: int = Field(foreign_key="job.id", index=True, ondelete="CASCADE")
+    run: int
+    extractor: Literal["specialist", "frontier"] = Field(sa_type=String)
+    model: str
+    invoice_data: dict | None = Field(default=None, sa_type=JsonB)
+    parse_error: str | None = Field(default=None)
+    raw_output: str | None = Field(default=None)
+    issues: list[dict] = Field(default_factory=list, sa_type=JsonB)
+    is_final: bool = Field(default=False)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC), sa_type=DateTime(timezone=True)
+    )
+    trigger: Literal["initial", "parse_fallback", "reconcile_retry"] = Field(
+        sa_type=String
+    )
 
 
 class Job(SQLModel, table=True):
@@ -34,7 +69,7 @@ class Job(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
     attempts: int = Field(default=1)
     status: Literal["pending", "complete", "extraction_failed", "error", "retrying"] = (
-        Field(default="pending", sa_column=Column(String, nullable=False))
+        Field(default="pending", sa_type=String)
     )
     error: str | None = Field(default=None)
     file_key: str
