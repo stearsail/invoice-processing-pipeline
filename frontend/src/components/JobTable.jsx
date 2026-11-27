@@ -47,8 +47,8 @@ export default function JobTable({ items, linkLabel, linkTo, showEntryId = false
       <tbody>
         {items.map((item) => {
           const sourceLabel = extractionSourceLabel(
-            item.ledger_entry?.extracted_by,
-            item.ledger_entry?.reviewed_with_changes,
+            item.extraction?.extractor,
+            item.ledger_entry?.corrected,
             { compact: true }
           )
           return (

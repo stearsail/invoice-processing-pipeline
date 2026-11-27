@@ -1,13 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { getJobDetail, getJobImageUrl } from '../lib/api'
-import {
-  CATEGORY_STYLES,
-  extractionSourceLabel,
-  friendlyIssueMessage,
-  toFormInvoice,
-  isReceipt,
-} from '../lib/invoiceForm'
+import ReviewIssues from '../components/ReviewIssues'
+import { isReceipt, startingInvoice, toReviewInfo } from '../lib/invoiceForm'
 
 const labelClass = 'block text-xs font-medium text-muted mb-1'
 
@@ -40,13 +35,8 @@ export default function JobDetailPage() {
     async function load() {
       try {
         const item = await getJobDetail(jobId)
-        setForm(toFormInvoice(item.ledger_entry?.invoice_data))
-        setReviewInfo({
-          jobError: item.error,
-          reviewReason: item.ledger_entry?.review_reason ?? [],
-          extractedBy: item.ledger_entry?.extracted_by ?? null,
-          reviewedWithChanges: item.ledger_entry?.reviewed_with_changes ?? null,
-        })
+        setForm(startingInvoice(item))
+        setReviewInfo(toReviewInfo(item))
       } catch (err) {
         if (err.status === 404) {
           setForm(false)
@@ -75,41 +65,15 @@ export default function JobDetailPage() {
   }
 
   const receipt = isReceipt(form.document_type)
-  const sourceLabel =
-    reviewInfo && extractionSourceLabel(reviewInfo.extractedBy, reviewInfo.reviewedWithChanges)
 
   return (
     <div className="mx-auto min-h-screen w-full px-[1%] bg-surface">
       <div className="grid grid-cols-2 gap-4 p-2">
         <div className="sticky top-10 max-h-[90vh] space-y-2 self-start overflow-y-auto pr-5">
-          {sourceLabel && <p className="text-xs text-muted">{sourceLabel}</p>}
-          <div>
-            {reviewInfo &&
-              (reviewInfo.jobError || reviewInfo.reviewReason.length > 0) && (
-                <div className="mb-6 rounded border border-amber-500/30 bg-amber-500/10 px-4 py-2">
-                  <h2 className="text-sm font-semibold text-amber-300">Issues:</h2>
-                  {reviewInfo.jobError && (
-                    <p className="text-sm text-red-300">{reviewInfo.jobError}</p>
-                  )}
-                  {reviewInfo.reviewReason.length > 0 && (
-                    <ul className="list-disc space-y-1 pl-5 text-sm">
-                      {reviewInfo.reviewReason.map((issue, idx) => (
-                        <li
-                          key={idx}
-                          title={issue.message}
-                          className={CATEGORY_STYLES[issue.category] || 'text-body'}
-                        >
-                          <span className="text-xs font-medium uppercase opacity-70">
-                            {issue.category}
-                          </span>{' '}
-                          — {friendlyIssueMessage(issue)}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-          </div>
+          {reviewInfo?.sourceLabel && (
+            <p className="text-xs text-muted">{reviewInfo.sourceLabel}</p>
+          )}
+          <ReviewIssues reviewInfo={reviewInfo} />
           <div className="grid grid-cols-2 gap-5">
             <div>
               <label className={labelClass}>Document type</label>

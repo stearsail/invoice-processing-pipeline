@@ -4,27 +4,24 @@ export const CATEGORY_STYLES = {
   duplicate: 'text-purple-300',
 }
 
-// Maps the category prefix categorize_error() embeds in "unverifiable" issue
-// messages (e.g. "Extraction failed entirely — invalid_output: 1 validation
-// error for Invoice ...") to plain-language copy for non-developers.
+// Plain-language copy for the "category: detail" prefix categorize_error() puts on each parse error
 export const ERROR_CATEGORY_MESSAGES = {
   connectivity:
     'Temporarily unable to reach the extraction service — this usually resolves on retry.',
   bad_input: 'Bad input, error decoding or identifying image file.',
+  rejected_input: 'The extraction service rejected this document.',
   invalid_output:
     "The extracted data didn't match the expected format for one or more fields (e.g., a non-numeric value where a number was expected).",
   unknown: 'Something unexpected happened while processing this document.',
 }
 
-// Only "unverifiable" issues carry an embedded category prefix (it's the one
-// category validate_reconcile builds from a raw parse_error); other
-// categories (mismatch, duplicate) already have human-authored messages.
-export function friendlyIssueMessage(issue) {
-  if (issue.category !== 'unverifiable') return issue.message
-  const category = Object.keys(ERROR_CATEGORY_MESSAGES).find((cat) =>
-    issue.message.includes(`${cat}:`)
-  )
-  return category ? ERROR_CATEGORY_MESSAGES[category] : issue.message
+// job.error on a total failure joins every attempt's parse error with "; "
+export function friendlyJobError(error) {
+  if (!error) return null
+  const messages = Object.keys(ERROR_CATEGORY_MESSAGES)
+    .filter((category) => error.includes(`${category}:`))
+    .map((category) => ERROR_CATEGORY_MESSAGES[category])
+  return messages.length > 0 ? messages.join(' ') : error
 }
 
 // Receipts don't carry customer or due-date info in this schema's training
@@ -34,17 +31,31 @@ export function isReceipt(documentType) {
   return documentType === 'receipt'
 }
 
-// Deliberately understated — an attribution line, not a warning banner. Null
-// for entries with no captured attempt (written by a human from scratch via
-// edit_job, or predating this field).
-export function extractionSourceLabel(extractedBy, reviewedWithChanges, { compact = false } = {}) {
-  if (!extractedBy) return null
+// An attribution line, not a warning; null when no model produced an invoice
+export function extractionSourceLabel(extractor, corrected, { compact = false } = {}) {
+  if (!extractor) return null
   if (compact) {
-    return reviewedWithChanges ? `${extractedBy} · edited` : extractedBy
+    return corrected ? `${extractor} · edited` : extractor
   }
-  return reviewedWithChanges
-    ? `Extracted by ${extractedBy} · corrected on review`
-    : `Extracted by ${extractedBy}`
+  return corrected
+    ? `Extracted by ${extractor} · corrected on review`
+    : `Extracted by ${extractor}`
+}
+
+// Once approved, the model's issues and errors are resolved history, not open problems
+export function toReviewInfo(item) {
+  const approved = item.ledger_entry != null
+  return {
+    sourceLabel: extractionSourceLabel(item.extraction?.extractor, item.ledger_entry?.corrected),
+    jobError: approved ? null : item.error,
+    issues: approved ? [] : (item.extraction?.issues ?? []),
+    loadErrors: [item.extraction_error, item.ledger_entry_error].filter(Boolean),
+  }
+}
+
+// An edit continues from the approved invoice; a first review starts from the model's
+export function startingInvoice(item) {
+  return toFormInvoice(item.ledger_entry?.invoice_data ?? item.extraction?.invoice_data)
 }
 
 export const BLANK_PARTY = { name: '', address: '', tax_id: '', iban: '' }

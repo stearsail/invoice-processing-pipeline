@@ -7,14 +7,13 @@ import {
   deleteJob,
   getJobImageUrl,
 } from '../lib/api'
+import ReviewIssues from '../components/ReviewIssues'
 import {
-  CATEGORY_STYLES,
-  extractionSourceLabel,
-  friendlyIssueMessage,
-  toFormInvoice,
   BLANK_LINE_ITEM,
   lineItemHasData,
   isReceipt,
+  startingInvoice,
+  toReviewInfo,
 } from '../lib/invoiceForm'
 
 function blankToNull(value) {
@@ -91,30 +90,25 @@ function JobEditPageInner() {
   const { jobId } = useParams()
   const navigate = useNavigate()
   const [form, setForm] = useState(null)
-  const [error, setError] = useState(null)
+  // load failures replace the page; save/delete failures (e.g. a 409) keep the form
+  const [loadError, setLoadError] = useState(null)
+  const [actionError, setActionError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [reviewInfo, setReviewInfo] = useState(null)
   const receipt = isReceipt(form?.document_type)
-  const sourceLabel =
-    reviewInfo && extractionSourceLabel(reviewInfo.extractedBy, reviewInfo.reviewedWithChanges)
 
   useEffect(() => {
     async function load() {
       try {
         const item = await getJobDetail(jobId)
-        setForm(toFormInvoice(item.ledger_entry?.invoice_data))
-        setReviewInfo({
-          jobError: item.error,
-          reviewReason: item.ledger_entry?.review_reason ?? [],
-          extractedBy: item.ledger_entry?.extracted_by ?? null,
-          reviewedWithChanges: item.ledger_entry?.reviewed_with_changes ?? null,
-        })
+        setForm(startingInvoice(item))
+        setReviewInfo(toReviewInfo(item))
       } catch (err) {
         if (err.status === 404) {
           setForm(false)
         } else {
-          setError(err.message)
+          setLoadError(err.message)
         }
       }
     }
@@ -177,12 +171,12 @@ function JobEditPageInner() {
   async function handleSubmit(event) {
     event.preventDefault()
     setSubmitting(true)
-    setError(null)
+    setActionError(null)
     try {
       await submitJobEdit(jobId, toPayload(form))
       await goToNextReviewItem()
     } catch (err) {
-      setError(err.message)
+      setActionError(err.message)
       setSubmitting(false)
     }
   }
@@ -190,17 +184,17 @@ function JobEditPageInner() {
   async function handleDelete() {
     if (!window.confirm(`Delete job ${jobId}? This cannot be undone.`)) return
     setDeleting(true)
-    setError(null)
+    setActionError(null)
     try {
       await deleteJob(jobId)
       await goToNextReviewItem()
     } catch (err) {
-      setError(err.message)
+      setActionError(err.message)
       setDeleting(false)
     }
   }
 
-  if (error) return <p className="p-10 text-sm text-red-400">{error}</p>
+  if (loadError) return <p className="p-10 text-sm text-red-400">{loadError}</p>
   if (form === null) return <p className="p-10 text-sm text-muted">Loading…</p>
   if (form === false) {
     return (
@@ -223,34 +217,10 @@ function JobEditPageInner() {
           onSubmit={handleSubmit}
           className="sticky top-10 max-h-[90vh] space-y-2 self-start overflow-y-auto pr-5"
         >
-          {sourceLabel && <p className="text-xs text-muted">{sourceLabel}</p>}
-          <div>
-          {reviewInfo &&
-            (reviewInfo.jobError || reviewInfo.reviewReason.length > 0) && (
-              <div className="mb-6 rounded border border-amber-500/30 bg-amber-500/10 px-4 py-2">
-                <h2 className="text-sm font-semibold text-amber-300">Issues:</h2>
-                {reviewInfo.jobError && (
-                  <p className="text-sm text-red-300">{reviewInfo.jobError}</p>
-                )}
-                {reviewInfo.reviewReason.length > 0 && (
-                  <ul className="list-disc space-y-1 pl-5 text-sm">
-                    {reviewInfo.reviewReason.map((issue, idx) => (
-                      <li
-                        key={idx}
-                        title={issue.message}
-                        className={CATEGORY_STYLES[issue.category] || 'text-body'}
-                      >
-                        <span className="text-xs font-medium uppercase opacity-70">
-                          {issue.category}
-                        </span>{' '}
-                        — {friendlyIssueMessage(issue)}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-        </div>
+          {reviewInfo?.sourceLabel && (
+            <p className="text-xs text-muted">{reviewInfo.sourceLabel}</p>
+          )}
+          <ReviewIssues reviewInfo={reviewInfo} />
           <div className="grid grid-cols-2 gap-5">
             <div>
               <label className={labelClass}>Document type</label>
@@ -462,7 +432,7 @@ function JobEditPageInner() {
             />
           </div>
 
-          {error && <p className="text-sm text-red-400">{error}</p>}
+          {actionError && <p className="text-sm text-red-400">{actionError}</p>}
           <div className='flex items-center gap-3 mt-5'>
             <button
               type="submit"
